@@ -6,3 +6,14 @@ dist/
 .pytest_cache/
 .venv/
 build/
+
+# Secrets / credentials — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+tunnel*
+cloudflared*
+ngrok*
