@@ -556,10 +556,10 @@ def _ws_execute_tool(sock, tool: str, params: dict, conn: dict, req_id) -> None:
     # Monitor & Manage
     elif tool == "system_info":
         cmd = ('cpu=$(top -bn1 2>/dev/null | grep -oP "[0-9.]+%" | head -1 | tr -d "%" || echo 0);'
-               'ram_total=$(free -m 2>/dev/null | awk "/Mem:/{print \$2}" || echo 0);'
-               'ram_used=$(free -m 2>/dev/null | awk "/Mem:/{print \$3}" || echo 0);'
-               'disk_total=$(df -m /data 2>/dev/null | awk "END{print \$2}" || echo 0);'
-               'disk_used=$(df -m /data 2>/dev/null | awk "END{print \$3}" || echo 0);'
+               'ram_total=$(free -m 2>/dev/null | awk "/Mem:/{print \\$2}" || echo 0);'
+               'ram_used=$(free -m 2>/dev/null | awk "/Mem:/{print \\$3}" || echo 0);'
+               'disk_total=$(df -m /data 2>/dev/null | awk "END{print \\$2}" || echo 0);'
+               'disk_used=$(df -m /data 2>/dev/null | awk "END{print \\$3}" || echo 0);'
                'echo "{\\"cpu_percent\\":\\"$cpu\\",\\"ram_mb_total\\":$ram_total,\\"ram_mb_used\\":$ram_used,\\"disk_mb_total\\":$disk_total,\\"disk_mb_used\\":$disk_used}"')
 
     elif tool == "process_list":

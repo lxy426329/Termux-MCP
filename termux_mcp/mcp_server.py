@@ -13,12 +13,12 @@ Security:
     with realpath resolution.
 """
 
-import hmac
 import logging
 import threading
 
 from . import operations
-from .config import AUTH_TOKEN, MCP_HOST, MCP_PORT, REQUIRE_AUTH, WORKSPACE_ROOT
+from .auth import get_auth_provider
+from .config import MCP_HOST, MCP_PORT, WORKSPACE_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -132,13 +132,11 @@ def _build_mcp_app():
 
     app = mcp.streamable_http_app()
 
-    if REQUIRE_AUTH:
+    auth = get_auth_provider()
+    if auth.enabled:
         class _AuthMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request, call_next):
-                auth = request.headers.get("Authorization", "")
-                if auth.startswith("Bearer ") and hmac.compare_digest(
-                    auth[7:], AUTH_TOKEN
-                ):
+                if auth.authenticate(dict(request.headers)):
                     return await call_next(request)
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
 

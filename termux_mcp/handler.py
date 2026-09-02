@@ -1,11 +1,11 @@
-import hmac
 import json
 import logging
 import os
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
-from .config import AUTH_TOKEN, COMMAND_TIMEOUT, HOME, REQUIRE_AUTH
+from .auth import get_auth_provider
+from .config import COMMAND_TIMEOUT, HOME
 from .handlers.ai_power import (
     handle_smart_install, handle_permission_fix, handle_profile,
     handle_error_explain, handle_ssh_wizard, handle_service_guard,
@@ -47,10 +47,6 @@ logger = logging.getLogger(__name__)
 MAX_BODY_SIZE = 5 * 1024 * 1024  # 5 MB
 
 
-def _constant_time_compare(a: str, b: str) -> bool:
-    return hmac.compare_digest(a.encode(), b.encode())
-
-
 class MCPHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -62,13 +58,7 @@ class MCPHandler(BaseHTTPRequestHandler):
 
     def _authenticate(self) -> bool:
         """Check Bearer token if auth is required. Returns True if allowed."""
-        if not REQUIRE_AUTH:
-            return True
-        auth_header = self.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-            return _constant_time_compare(token, AUTH_TOKEN)
-        return False
+        return get_auth_provider().authenticate(dict(self.headers))
 
     def _send_unauthorized(self) -> None:
         body = json.dumps({"error": "Unauthorized"}).encode("utf-8")
