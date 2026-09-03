@@ -15,12 +15,82 @@ Security:
 
 import logging
 import threading
+import time
+from urllib.parse import urlparse
 
+from . import config
 from . import operations
 from .auth import get_auth_provider
 from .config import MCP_HOST, MCP_PORT, WORKSPACE_ROOT
 
 logger = logging.getLogger(__name__)
+
+# DNS rebinding protection (mcp SDK TransportSecuritySettings). localhost is
+# always allowed; the current trusted public tunnel host is added at runtime
+# once the CLI has verified a tunnel URL (see _watch_public_url). Hosts are
+# never derived from Host / X-Forwarded-* request headers.
+_LOCALHOST_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+_LOCALHOST_ORIGINS = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+_PUBLIC_URL_POLL_INTERVAL = 2.0
+
+_transport_security = None  # TransportSecuritySettings instance shared with FastMCP
+_transport_watcher = None   # daemon thread syncing allowed_hosts with the runtime URL
+_transport_lock = threading.Lock()
+
+
+def _host_entries_for_url(url: str) -> list:
+    """allowed_hosts entries (host + host:*) for a trusted public base URL."""
+    host = urlparse(url).hostname
+    if not host:
+        return []
+    return [host, f"{host}:*"]
+
+
+def _apply_public_url(settings, url: str) -> None:
+    """Replace allowed_hosts with localhost + the current trusted public host.
+
+    Replaces (never appends) so a changed tunnel hostname does not leave the
+    previous host trusted indefinitely.
+    """
+    entries = list(_LOCALHOST_HOSTS)
+    if url:
+        entries.extend(_host_entries_for_url(url))
+    settings.allowed_hosts = entries
+
+
+def _watch_public_url(settings) -> None:
+    """Daemon loop: keep allowed_hosts in sync with the runtime public URL.
+
+    The MCP server can start before the CLI tunnel succeeds, so the trusted
+    public host is learned from the runtime public-URL registry (written by
+    the CLI only after a tunnel is verified) rather than from request headers.
+    """
+    current = None
+    while True:
+        try:
+            url = config.get_public_url()
+            if url != current:
+                current = url
+                _apply_public_url(settings, url)
+        except Exception:
+            pass
+        time.sleep(_PUBLIC_URL_POLL_INTERVAL)
+
+
+def _start_transport_security_watcher() -> None:
+    """Start the public-URL watcher thread once (production server only)."""
+    global _transport_watcher
+    if _transport_security is None:
+        return
+    with _transport_lock:
+        if _transport_watcher is None or not _transport_watcher.is_alive():
+            _transport_watcher = threading.Thread(
+                target=_watch_public_url,
+                args=(_transport_security,),
+                daemon=True,
+                name="transport-security-watcher",
+            )
+            _transport_watcher.start()
 
 
 # ── MCP tools (module-level so tests can call them directly) ─────────────────
@@ -113,12 +183,37 @@ def tool_send_notification(
 def _build_mcp_app():
     """Build the FastMCP server and return its Starlette app (with auth)."""
     from mcp.server.fastmcp import FastMCP
+    from mcp.server.transport_security import TransportSecuritySettings
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
 
     from . import oauth
 
-    mcp = FastMCP("termux-mcp", json_response=True)
+    global _transport_security
+    # Keep DNS rebinding protection enabled. localhost stays allowed; the
+    # trusted public tunnel host is added once known (see _apply_public_url /
+    # _watch_public_url). Passing settings explicitly also keeps the exact
+    # same localhost defaults the SDK would auto-apply for host=127.0.0.1.
+    _transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=list(_LOCALHOST_HOSTS),
+        allowed_origins=list(_LOCALHOST_ORIGINS),
+    )
+
+    mcp = FastMCP(
+        "termux-mcp",
+        json_response=True,
+        transport_security=_transport_security,
+    )
+
+    # FastMCP copies the settings into its own Settings object and the
+    # session manager reads that copy, so keep the module reference on the
+    # copy for runtime updates (see _apply_public_url / _watch_public_url).
+    _transport_security = mcp.settings.transport_security
+    # Seed with any already-known public URL (configured TERMUX_MCP_PUBLIC_URL
+    # or a runtime URL written before the server started). Tunnel URLs that
+    # arrive later are picked up by the watcher thread in start_mcp_server().
+    _apply_public_url(_transport_security, config.get_public_url())
 
     # Explicit names: the module-level functions keep their `tool_` prefix
     # so tests can call them directly, but the MCP protocol exposes the
@@ -180,6 +275,11 @@ def start_mcp_server():
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Failed to build MCP app: %s", e)
         return None
+
+    # The CLI may start the tunnel after this server is already up; the
+    # watcher keeps DNS-rebinding allowed_hosts in sync with the runtime
+    # public URL so the verified tunnel host is accepted.
+    _start_transport_security_watcher()
 
     config = uvicorn.Config(app, host=MCP_HOST, port=MCP_PORT, log_level="warning")
     server = uvicorn.Server(config)
