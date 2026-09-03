@@ -14,8 +14,10 @@ build/
 *.pem
 *.key
 *.p12
-tunnel*
-cloudflared*
-ngrok*
+# Tunnel binaries / artifacts (root-level only — do NOT match source files
+# like termux_mcp/tunnel.py)
+/tunnel*
+/cloudflared*
+/ngrok*
 config.env
 *.local
