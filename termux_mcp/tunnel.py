@@ -24,6 +24,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional
 
+from . import process
 from .config import TUNNEL_PROVIDERS, TUNNEL_TIMEOUT
 
 # URL patterns per provider, in priority order.
@@ -91,22 +92,31 @@ def _run_and_wait_for_url(
 
     Output is read on a background thread into a queue so the timeout is
     always honored even if the tunnel process goes completely silent
-    (e.g. cloudflared stuck in precheck). Terminates the process on
-    timeout or when an auth prompt appears.
+    (e.g. cloudflared stuck in precheck). Every line is also appended to
+    the tunnel log (~/.local/state/termux-mcp/tunnel.log) so failures can
+    be diagnosed later. stdin is /dev/null so an SSH password prompt can
+    never block the launcher. Terminates the process on timeout or when an
+    auth prompt appears.
     """
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
         text=True,
         env=os.environ.copy(),
     )
     out_q: "queue.Queue[str]" = queue.Queue()
+    log_path = process.TUNNEL_LOG_FILE
 
     def _reader() -> None:
         try:
-            for line in proc.stdout:
-                out_q.put(line)
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "a", encoding="utf-8", errors="replace") as log_f:
+                for line in proc.stdout:
+                    out_q.put(line)
+                    log_f.write(line)
+                    log_f.flush()
         except Exception:
             pass
 
@@ -168,7 +178,20 @@ class PinggyProvider(TunnelProvider):
         return shutil.which("ssh") is not None
 
     def start(self, port: int, timeout: int) -> TunnelResult:
-        cmd = ["ssh", "-p", "443", "-R", f"0:localhost:{port}", "a@free.pinggy.io"]
+        # Non-interactive flags verified on-device:
+        #   -p 443, StrictHostKeyChecking=no, ServerAliveInterval=30,
+        #   BatchMode=yes (never prompt for a password), ConnectTimeout,
+        #   ExitOnForwardFailure, and 127.0.0.1 (avoid IPv6 localhost).
+        cmd = [
+            "ssh", "-p", "443",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ServerAliveInterval=30",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=15",
+            "-o", "ExitOnForwardFailure=yes",
+            "-R", f"0:127.0.0.1:{port}",
+            "a@free.pinggy.io",
+        ]
         return _run_and_wait_for_url(self.name, cmd, _URL_PATTERNS[self.name], timeout)
 
 
@@ -190,7 +213,16 @@ class LocalhostRunProvider(TunnelProvider):
         return shutil.which("ssh") is not None
 
     def start(self, port: int, timeout: int) -> TunnelResult:
-        cmd = ["ssh", "-R", f"80:localhost:{port}", "nokey@localhost.run"]
+        cmd = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ServerAliveInterval=30",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=15",
+            "-o", "ExitOnForwardFailure=yes",
+            "-R", f"80:127.0.0.1:{port}",
+            "nokey@localhost.run",
+        ]
         return _run_and_wait_for_url(self.name, cmd, _URL_PATTERNS[self.name], timeout)
 
 
@@ -215,9 +247,12 @@ def start_tunnel(
 
     `provider="auto"` tries each configured provider in order
     (TERMUX_MCP_TUNNEL_PROVIDERS), skipping unavailable ones and falling
-    back on timeout/failure.
+    back on timeout/failure. A provider only counts as successful once its
+    public URL is actually reachable (see verify_url) — a parsed URL that
+    does not answer (e.g. Cloudflare 530) is treated as a failure.
     """
     timeout = timeout or TUNNEL_TIMEOUT
+    last_error = ""
     if provider == "auto":
         for name in TUNNEL_PROVIDERS:
             p = get_provider(name)
@@ -225,10 +260,16 @@ def start_tunnel(
                 continue
             result = p.start(port, timeout)
             if result.url:
-                return result
+                if verify_url(result.url):
+                    return result
+                if result.process:
+                    _terminate(result.process)
+                last_error = f"{name}: public URL not reachable: {result.url}"
+                continue
+            last_error = f"{name}: {result.error}"
         return TunnelResult(
             provider="auto",
-            error="all configured providers failed (see errors above)",
+            error=f"all configured providers failed: {last_error}",
         )
     p = get_provider(provider)
     if p is None:
@@ -238,17 +279,30 @@ def start_tunnel(
             provider=provider,
             error=f"{provider} is not installed (install ssh/cloudflared)",
         )
-    return p.start(port, timeout)
+    result = p.start(port, timeout)
+    if result.url and not verify_url(result.url):
+        if result.process:
+            _terminate(result.process)
+        return TunnelResult(
+            provider=provider,
+            error=f"public URL not reachable: {result.url}",
+        )
+    return result
 
 
 def verify_url(url: str, timeout: float = 15.0) -> bool:
-    """Check that a public URL is reachable.
+    """Check that a public MCP endpoint is reachable.
 
-    Any HTTP response (including 401 — auth working as intended) counts as
-    reachable; only network-level failures count as unreachable.
+    Probes `{url}/mcp` without any Authorization header. Any HTTP response
+    (including 401 — auth working as intended) counts as reachable; only
+    network-level failures and Cloudflare 530 (origin unreachable) count as
+    unreachable.
     """
+    probe = url.rstrip("/")
+    if not probe.endswith("/mcp"):
+        probe += "/mcp"
     try:
-        req = urllib.request.Request(url, method="GET")
+        req = urllib.request.Request(probe, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return True
     except urllib.error.HTTPError as e:

@@ -4,6 +4,7 @@ State lives under ~/.local/state/termux-mcp/ (XDG-style):
   server.pid   — PID of the running `python -m termux_mcp` server
   tunnel.pid   — PID of the active tunnel process (if any)
   server.log   — captured stdout/stderr of the server
+  tunnel.log   — captured stdout/stderr of the tunnel process
 
 The launcher never uses bare `&` backgrounding: every child is tracked by
 PID file, and stop/restart/status operate on those PIDs.
@@ -22,6 +23,7 @@ STATE_DIR: str = os.path.join(HOME, ".local", "state", "termux-mcp")
 PID_FILE: str = os.path.join(STATE_DIR, "server.pid")
 TUNNEL_PID_FILE: str = os.path.join(STATE_DIR, "tunnel.pid")
 LOG_FILE: str = os.path.join(STATE_DIR, "server.log")
+TUNNEL_LOG_FILE: str = os.path.join(STATE_DIR, "tunnel.log")
 
 
 def state_dir() -> str:
@@ -38,6 +40,10 @@ def tunnel_pid_file() -> str:
 
 def log_file() -> str:
     return LOG_FILE
+
+
+def tunnel_log_file() -> str:
+    return TUNNEL_LOG_FILE
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -111,7 +117,33 @@ def clear_tunnel_pid() -> None:
 
 
 def is_running() -> bool:
-    return _pid_alive(read_pid())
+    """True when the server PID file points at a live process.
+
+    A stale PID file (process already dead) is cleaned up so status/start
+    never report a phantom running server.
+    """
+    pid = read_pid()
+    if not pid:
+        return False
+    if _pid_alive(pid):
+        return True
+    clear_pid()
+    return False
+
+
+def tunnel_is_running() -> bool:
+    """True when the tunnel PID file points at a live process.
+
+    A stale tunnel.pid (process already dead) is cleaned up so status/stop
+    never report a phantom running tunnel.
+    """
+    pid = read_tunnel_pid()
+    if not pid:
+        return False
+    if _pid_alive(pid):
+        return True
+    clear_tunnel_pid()
+    return False
 
 
 def kill_pid(pid: Optional[int], timeout: float = 5.0) -> bool:
@@ -224,6 +256,16 @@ def tail_log(n: int = 50) -> str:
     """Return the last n lines of the server log."""
     try:
         with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return "".join(lines[-n:])
+    except OSError:
+        return ""
+
+
+def tail_tunnel_log(n: int = 50) -> str:
+    """Return the last n lines of the tunnel log."""
+    try:
+        with open(TUNNEL_LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
         return "".join(lines[-n:])
     except OSError:

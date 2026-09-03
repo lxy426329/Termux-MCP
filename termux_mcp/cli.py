@@ -141,11 +141,14 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def cmd_stop() -> int:
-    tunnel_pid = process.read_tunnel_pid()
-    if tunnel_pid:
-        process.kill_pid(tunnel_pid)
+    if process.tunnel_is_running():
+        pid = process.read_tunnel_pid()
+        process.kill_pid(pid)
         process.clear_tunnel_pid()
-        print(f"Tunnel stopped (pid {tunnel_pid})")
+        print(f"Tunnel stopped (pid {pid})")
+    else:
+        # Clean up a stale tunnel.pid if present.
+        process.clear_tunnel_pid()
     if process.is_running():
         pid = process.read_pid()
         process.stop_server()
@@ -174,9 +177,8 @@ def cmd_status() -> int:
     print(f"Auth: {'enabled' if token_configured() else 'DISABLED'}")
     if WORKSPACE_ROOT:
         print(f"Workspace: {WORKSPACE_ROOT}")
-    tunnel_pid = process.read_tunnel_pid()
-    if tunnel_pid:
-        print(f"Tunnel: running (pid {tunnel_pid})")
+    if process.tunnel_is_running():
+        print(f"Tunnel: running (pid {process.read_tunnel_pid()})")
     return 0 if running else 1
 
 

@@ -17,6 +17,7 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(process, "PID_FILE", str(tmp_path / "server.pid"))
     monkeypatch.setattr(process, "TUNNEL_PID_FILE", str(tmp_path / "tunnel.pid"))
     monkeypatch.setattr(process, "LOG_FILE", str(tmp_path / "server.log"))
+    monkeypatch.setattr(process, "TUNNEL_LOG_FILE", str(tmp_path / "tunnel.log"))
     return tmp_path
 
 
@@ -86,6 +87,39 @@ def test_tunnel_pid_roundtrip(isolated_state):
     assert process.read_tunnel_pid() == 12345
     process.clear_tunnel_pid()
     assert process.read_tunnel_pid() is None
+
+
+def test_tunnel_is_running_live_pid(isolated_state):
+    process.write_tunnel_pid(os.getpid())
+    assert process.tunnel_is_running() is True
+    assert process.read_tunnel_pid() == os.getpid()
+
+
+def test_tunnel_is_running_stale_pid_cleaned(isolated_state):
+    """A dead tunnel PID must report not-running AND clean the stale file."""
+    process.write_tunnel_pid(99999999)  # almost certainly dead
+    assert process.tunnel_is_running() is False
+    assert process.read_tunnel_pid() is None  # stale pidfile removed
+
+
+def test_tail_tunnel_log(isolated_state):
+    (isolated_state / "tunnel.log").write_text(
+        "line1\nline2\nline3\n", encoding="utf-8"
+    )
+    assert process.tail_tunnel_log(2) == "line2\nline3\n"
+    assert process.tail_tunnel_log(50) == "line1\nline2\nline3\n"
+
+
+def test_status_uses_tunnel_is_running(isolated_state, monkeypatch, capsys):
+    """status must only report a tunnel when its PID is really alive."""
+    monkeypatch.setattr(process, "is_running", lambda: False)
+    monkeypatch.setattr(process, "port_open", lambda port, **kw: False)
+    monkeypatch.setattr(process, "tunnel_is_running", lambda: True)
+    monkeypatch.setattr(process, "read_tunnel_pid", lambda: 12345)
+    rc = cli.cmd_status()
+    out = capsys.readouterr().out
+    assert "Tunnel: running (pid 12345)" in out
+    assert rc == 1  # server not running
 
 
 def test_port_open_closed(isolated_state):
