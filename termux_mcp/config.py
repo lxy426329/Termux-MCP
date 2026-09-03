@@ -85,6 +85,63 @@ MAX_OUTPUT_BYTES: int = int(_env_or_file("TERMUX_MCP_MAX_OUTPUT", "20000"))
 AUTH_TOKEN: str = _env_or_file("TERMUX_MCP_AUTH_TOKEN", "")
 REQUIRE_AUTH: bool = bool(AUTH_TOKEN)
 
+# OAuth / auth-discovery (RFC 9728 protected resource metadata).
+# TERMUX_MCP_OAUTH_ISSUER enables OAuth mode. The special value "auto"
+# resolves the issuer to the current public URL (runtime tunnel URL, else
+# TERMUX_MCP_PUBLIC_URL) so metadata stays correct even though tunnel URLs
+# change on restart. TERMUX_MCP_PUBLIC_URL is the externally visible MCP
+# base URL (e.g. https://mcp.example.com) used for the protected-resource
+# `resource` field and the WWW-Authenticate resource_metadata challenge.
+PUBLIC_URL: str = _env_or_file("TERMUX_MCP_PUBLIC_URL", "").strip()
+OAUTH_ISSUER: str = _env_or_file("TERMUX_MCP_OAUTH_ISSUER", "").strip()
+OAUTH_SCOPES: str = _env_or_file("TERMUX_MCP_OAUTH_SCOPES", "mcp:read mcp:write").strip()
+
+# Runtime public URL, written by the launcher after a tunnel starts so the
+# server process (a separate subprocess) can serve correct OAuth metadata
+# without trusting Host/X-Forwarded-* headers.
+PUBLIC_URL_FILE: str = os.path.join(HOME, ".local", "state", "termux-mcp", "public_url")
+
+
+def set_public_url(url: str) -> None:
+    """Record the externally reachable MCP base URL (runtime, from tunnel)."""
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return
+    os.makedirs(os.path.dirname(PUBLIC_URL_FILE), exist_ok=True)
+    with open(PUBLIC_URL_FILE, "w", encoding="utf-8") as f:
+        f.write(url)
+
+
+def clear_public_url() -> None:
+    """Drop the runtime public URL (used when the tunnel stops)."""
+    try:
+        os.remove(PUBLIC_URL_FILE)
+    except OSError:
+        pass
+
+
+def get_public_url() -> str:
+    """Current externally reachable MCP base URL (runtime > config)."""
+    try:
+        with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
+            url = f.read().strip().rstrip("/")
+        if url:
+            return url
+    except OSError:
+        pass
+    return PUBLIC_URL.rstrip("/")
+
+
+def public_url_source() -> str:
+    """Where the public URL comes from: "runtime", "configured", or ""."""
+    try:
+        with open(PUBLIC_URL_FILE, "r", encoding="utf-8") as f:
+            if f.read().strip():
+                return "runtime"
+    except OSError:
+        pass
+    return "configured" if PUBLIC_URL else ""
+
 # MCP Streamable HTTP layer (official `mcp` Python SDK).
 MCP_ENABLED: bool = _env_or_file("TERMUX_MCP_MCP_ENABLED", "1").lower() in (
     "1", "true", "yes", "on",

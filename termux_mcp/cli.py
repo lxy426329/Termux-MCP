@@ -30,8 +30,12 @@ from .config import (
     MCP_PORT,
     PORT,
     WORKSPACE_ROOT,
+    clear_public_url,
     ensure_token,
+    get_public_url,
+    public_url_source,
     rotate_token,
+    set_public_url,
     token_configured,
 )
 
@@ -120,6 +124,9 @@ def cmd_start(args: argparse.Namespace) -> int:
             print(f"Tunnel ({result.provider}): {mcp_url}")
             if result.process and result.process.pid:
                 process.write_tunnel_pid(result.process.pid)
+            # Propagate the real public URL so OAuth metadata / challenges
+            # served by the server process use it (never Host headers).
+            set_public_url(result.url)
             if tunnel_mod.verify_url(result.url):
                 print("Public endpoint: reachable")
             else:
@@ -149,6 +156,7 @@ def cmd_stop() -> int:
     else:
         # Clean up a stale tunnel.pid if present.
         process.clear_tunnel_pid()
+    clear_public_url()
     if process.is_running():
         pid = process.read_pid()
         process.stop_server()
@@ -179,6 +187,20 @@ def cmd_status() -> int:
         print(f"Workspace: {WORKSPACE_ROOT}")
     if process.tunnel_is_running():
         print(f"Tunnel: running (pid {process.read_tunnel_pid()})")
+    # OAuth / discovery state — never print tokens or client secrets.
+    from . import oauth
+    if oauth.oauth_enabled():
+        print("OAuth resource metadata: enabled")
+        issuer = oauth.get_issuer()
+        print(f"OAuth issuer: {issuer or 'not resolvable (auto + no public URL)'}")
+    else:
+        print("OAuth resource metadata: disabled (static Bearer mode)")
+    pub = get_public_url()
+    source = public_url_source()
+    if pub:
+        print(f"Public MCP URL: {source} — {pub}/mcp")
+    else:
+        print("Public MCP URL: unavailable")
     return 0 if running else 1
 
 
@@ -253,6 +275,20 @@ def cmd_doctor() -> int:
     # Auth
     _check(checks, "Auth token configured", token_configured(),
            "enabled" if token_configured() else "DISABLED — run 'termux-mcp start'")
+
+    # OAuth / discovery (no secrets printed; absence is not a FAIL when
+    # static Bearer mode is intentionally used).
+    from . import oauth
+    if oauth.oauth_enabled():
+        issuer = oauth.get_issuer()
+        _check(checks, "OAuth resource metadata", True, "enabled")
+        _check(checks, "OAuth issuer", bool(issuer),
+               issuer or "auto — no public URL yet", warn=not issuer)
+        pub = get_public_url()
+        _check(checks, "Public MCP URL", bool(pub),
+               f"{pub}/mcp" if pub else "unavailable", warn=not pub)
+    else:
+        _check(checks, "OAuth resource metadata", True, "disabled (static Bearer mode)")
 
     # Workspace
     if WORKSPACE_ROOT:

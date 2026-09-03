@@ -30,6 +30,7 @@ REQUIRED_FILES = [
     "termux_mcp/config.py",
     "termux_mcp/handler.py",
     "termux_mcp/mcp_server.py",
+    "termux_mcp/oauth.py",
     "termux_mcp/operations.py",
     "termux_mcp/process.py",
     "termux_mcp/server.py",

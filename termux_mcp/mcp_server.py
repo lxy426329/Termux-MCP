@@ -116,6 +116,8 @@ def _build_mcp_app():
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
 
+    from . import oauth
+
     mcp = FastMCP("termux-mcp", json_response=True)
 
     # Explicit names: the module-level functions keep their `tool_` prefix
@@ -132,13 +134,30 @@ def _build_mcp_app():
 
     app = mcp.streamable_http_app()
 
+    # OAuth: authorization-server + protected-resource metadata routes.
+    # These are public (no Bearer required) so MCP clients can discover
+    # and complete the OAuth flow. When OAuth is disabled nothing is
+    # advertised and the static Bearer behavior is unchanged.
+    if oauth.oauth_enabled():
+        for route in oauth.build_auth_routes():
+            app.router.routes.append(route)
+        for route in oauth.build_protected_resource_routes():
+            app.router.routes.append(route)
+
     auth = get_auth_provider()
     if auth.enabled:
         class _AuthMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request, call_next):
-                if auth.authenticate(dict(request.headers)):
+                if oauth.is_public_path(request.url.path):
                     return await call_next(request)
-                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+                result = await auth.authenticate_async(dict(request.headers))
+                if result.authorized:
+                    return await call_next(request)
+                return JSONResponse(
+                    {"error": "Unauthorized"},
+                    status_code=401,
+                    headers=auth.challenge_headers(),
+                )
 
         app.add_middleware(_AuthMiddleware)
 
