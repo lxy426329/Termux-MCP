@@ -13,6 +13,7 @@ before the provider counts as successful. Tunnel URLs are
 deployment-sensitive and are never uploaded anywhere.
 """
 
+import json
 import os
 import queue
 import re
@@ -21,6 +22,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -29,19 +31,44 @@ from typing import List, Optional
 from . import process
 from .config import TUNNEL_PROVIDERS, TUNNEL_TIMEOUT
 
-# URL patterns per provider, in priority order.
+# URL patterns per provider, in priority order. These are STRICT: they only
+# match real tunnel hostnames, never dashboard/management pages. Pinggy
+# prints its dashboard/upgrade links (e.g. https://dashboard.pinggy.io)
+# alongside the actual tunnel URL, so the parser must skip anything that is
+# not a tunnel hostname.
 _URL_PATTERNS = {
     "pinggy": [
-        r"https://[a-zA-Z0-9-]+\.a\.free\.pinggy\.link",
-        r"https://[a-zA-Z0-9-]+\.pinggy\.io",
-        r"https://[a-zA-Z0-9-]+\.pinggy\.link",
+        r"https://[a-z0-9][a-z0-9-]*\.a\.free\.pinggy\.link$",
+        r"https://[a-z0-9][a-z0-9-]*\.a\.pinggy\.link$",
+        r"https://[a-z0-9][a-z0-9-]*\.free\.pinggy\.net$",
+        r"https://[a-z0-9][a-z0-9-]*\.pinggy-free\.link$",
+        r"https://[a-z0-9][a-z0-9-]*\.a\.free\.pinggy\.online$",
     ],
     "cloudflare": [
-        r"https://[a-zA-Z0-9-]+\.trycloudflare\.com",
+        r"https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com$",
     ],
     "localhost-run": [
-        r"https://[a-zA-Z0-9-]+\.lhr\.life",
-        r"https://[a-zA-Z0-9-]+\.lhr\.rocks",
+        r"https://[a-z0-9][a-z0-9-]*\.lhr\.life$",
+        r"https://[a-z0-9][a-z0-9-]*\.lhr\.rocks$",
+    ],
+}
+
+# Hostname-level rules used to double-check a candidate URL before it enters
+# the public health check (defense in depth on top of the strict patterns).
+_TUNNEL_HOSTNAME_RULES = {
+    "pinggy": [
+        r"[a-z0-9][a-z0-9-]*\.a\.free\.pinggy\.link",
+        r"[a-z0-9][a-z0-9-]*\.a\.pinggy\.link",
+        r"[a-z0-9][a-z0-9-]*\.free\.pinggy\.net",
+        r"[a-z0-9][a-z0-9-]*\.pinggy-free\.link",
+        r"[a-z0-9][a-z0-9-]*\.a\.free\.pinggy\.online",
+    ],
+    "cloudflare": [
+        r"[a-z0-9][a-z0-9-]*\.trycloudflare\.com",
+    ],
+    "localhost-run": [
+        r"[a-z0-9][a-z0-9-]*\.lhr\.life",
+        r"[a-z0-9][a-z0-9-]*\.lhr\.rocks",
     ],
 }
 
@@ -92,11 +119,34 @@ class TunnelProvider(ABC):
 
 
 def _extract_https_url(text: str, patterns: List[str]) -> Optional[str]:
-    for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            return m.group(0).rstrip("/")
+    """Return the first HTTPS URL in `text` that matches any pattern.
+
+    Iterates every https:// URL in order so a non-tunnel URL printed first
+    (e.g. a Pinggy dashboard/upgrade link) is skipped in favor of the real
+    tunnel URL that follows.
+    """
+    for m in re.finditer(r"https://[^\s\"'<>]+", text):
+        url = m.group(0).rstrip("/.,;:)]}")
+        for pat in patterns:
+            if re.search(pat, url):
+                return url
     return None
+
+
+def _is_valid_tunnel_url(provider: str, url: str) -> bool:
+    """True when `url` is a real tunnel URL for `provider`.
+
+    Rejects dashboard/management pages (e.g. dashboard.pinggy.io) and any
+    hostname that does not match the provider's tunnel domain rules. Used
+    before the public health check so a bad candidate never gets probed.
+    """
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except Exception:
+        return False
+    return any(
+        re.fullmatch(pat, host) for pat in _TUNNEL_HOSTNAME_RULES.get(provider, [])
+    )
 
 
 def _spawn_pty(cmd: List[str]):
@@ -370,6 +420,14 @@ def start_tunnel(
                 continue
             result = p.start(port, timeout)
             if result.url:
+                if not _is_valid_tunnel_url(name, result.url):
+                    last_error = (
+                        f"{name}: URL does not match tunnel hostname rules: "
+                        f"{result.url}"
+                    )
+                    if result.process:
+                        _terminate(result.process)
+                    continue
                 if wait_for_public_url(result.url, result.process):
                     return result
                 if result.process and result.process.poll() is not None:
@@ -400,6 +458,15 @@ def start_tunnel(
         )
     result = p.start(port, timeout)
     if result.url:
+        if not _is_valid_tunnel_url(provider, result.url):
+            if result.process:
+                _terminate(result.process)
+            return TunnelResult(
+                provider=provider,
+                error=(
+                    f"URL does not match tunnel hostname rules: {result.url}"
+                ),
+            )
         if wait_for_public_url(result.url, result.process):
             return result
         if result.process and result.process.poll() is not None:
@@ -429,9 +496,10 @@ def wait_for_public_url(
 
     A parsed URL is not proof the tunnel works: Cloudflare quick tunnels
     print their URL before the edge is reachable. Retry every `interval`
-    seconds until the endpoint answers (401 counts as healthy — auth is
-    working) or `total_wait` expires. If the tunnel process exits while we
-    wait, fail immediately so the caller can report the exit code.
+    seconds until the endpoint answers (the MCP server's 401 + JSON body —
+    auth working as intended) or `total_wait` expires. If the tunnel
+    process exits while we wait, fail immediately so the caller can report
+    the exit code.
     """
     deadline = time.time() + total_wait
     while time.time() < deadline:
@@ -443,13 +511,28 @@ def wait_for_public_url(
     return False
 
 
-def verify_url(url: str, timeout: float = 15.0) -> bool:
-    """Check that a public MCP endpoint is reachable.
+def _looks_like_mcp_unauthorized(body: str) -> bool:
+    """True when the body matches the MCP server's 401 response.
 
-    Probes `{url}/mcp` without any Authorization header. Any HTTP response
-    (including 401 — auth working as intended) counts as reachable; only
-    network-level failures and Cloudflare 530 (origin unreachable) count as
-    unreachable.
+    The MCP endpoint returns `{"error": "Unauthorized"}` (JSON) when probed
+    without an Authorization header. Requiring this JSON structure avoids
+    false positives from third-party pages that happen to return 401.
+    """
+    try:
+        data = json.loads(body)
+    except Exception:
+        return False
+    return isinstance(data, dict) and data.get("error") == "Unauthorized"
+
+
+def verify_url(url: str, timeout: float = 15.0) -> bool:
+    """Check that a public URL is the Termux-MCP endpoint.
+
+    Probes `{url}/mcp` without any Authorization header. Only the expected
+    unauthorized response from the MCP server counts as healthy: HTTP 401
+    with a JSON body like `{"error": "Unauthorized"}`. Anything else — 200
+    dashboard HTML, 301 redirects, 403/404 third-party pages, 502/530 — is
+    NOT the MCP endpoint and counts as unreachable.
     """
     probe = url.rstrip("/")
     if not probe.endswith("/mcp"):
@@ -457,8 +540,15 @@ def verify_url(url: str, timeout: float = 15.0) -> bool:
     try:
         req = urllib.request.Request(probe, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return True
+            return False  # 200 from a tunnel is not the MCP endpoint
     except urllib.error.HTTPError as e:
-        return e.code in (200, 401, 403, 404)
+        if e.code != 401:
+            return False
+        body = ""
+        try:
+            body = e.read(2048).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return _looks_like_mcp_unauthorized(body)
     except Exception:
         return False

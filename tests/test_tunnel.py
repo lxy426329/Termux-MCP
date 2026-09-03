@@ -5,6 +5,7 @@ Real tunnel connectivity is covered by the optional integration smoke test
 (scripts/mcp_smoke.py) and manual `termux-mcp start --tunnel ...`.
 """
 
+import io
 import os
 import subprocess
 import sys
@@ -27,7 +28,51 @@ def test_extract_https_url_pinggy():
 def test_extract_https_url_pinggy_io():
     text = "https://abc123.pinggy.io is live"
     url = tunnel._extract_https_url(text, tunnel._URL_PATTERNS["pinggy"])
-    assert url == "https://abc123.pinggy.io"
+    assert url is None  # pinggy.io is the official domain, not a tunnel
+
+
+def test_extract_https_url_picks_tunnel_over_dashboard():
+    """Pinggy prints dashboard/upgrade links before the real tunnel URL —
+    the parser must skip them and pick the actual tunnel hostname."""
+    text = (
+        "Dashboard: https://dashboard.pinggy.io\n"
+        "Upgrade: https://pinggy.io/pricing\n"
+        "Tunnel: https://abc123.a.free.pinggy.link"
+    )
+    url = tunnel._extract_https_url(text, tunnel._URL_PATTERNS["pinggy"])
+    assert url == "https://abc123.a.free.pinggy.link"
+
+
+def test_extract_https_url_free_pinggy_net():
+    text = "https://abc123.free.pinggy.net is live"
+    url = tunnel._extract_https_url(text, tunnel._URL_PATTERNS["pinggy"])
+    assert url == "https://abc123.free.pinggy.net"
+
+
+def test_extract_https_url_pinggy_free_link():
+    text = "https://abc123.pinggy-free.link is live"
+    url = tunnel._extract_https_url(text, tunnel._URL_PATTERNS["pinggy"])
+    assert url == "https://abc123.pinggy-free.link"
+
+
+def test_is_valid_tunnel_url():
+    assert tunnel._is_valid_tunnel_url(
+        "pinggy", "https://abc123.a.free.pinggy.link"
+    ) is True
+    assert tunnel._is_valid_tunnel_url(
+        "pinggy", "https://abc123.free.pinggy.net"
+    ) is True
+    assert tunnel._is_valid_tunnel_url(
+        "pinggy", "https://abc123.pinggy-free.link"
+    ) is True
+    assert tunnel._is_valid_tunnel_url("pinggy", "https://dashboard.pinggy.io") is False
+    assert tunnel._is_valid_tunnel_url("pinggy", "https://pinggy.io") is False
+    assert tunnel._is_valid_tunnel_url(
+        "cloudflare", "https://abc-123.trycloudflare.com"
+    ) is True
+    assert tunnel._is_valid_tunnel_url(
+        "localhost-run", "https://abc.lhr.life"
+    ) is True
 
 
 def test_extract_https_url_cloudflare():
@@ -215,18 +260,57 @@ def test_start_tunnel_auto_skips_unavailable(monkeypatch):
     assert result.url == "https://x.trycloudflare.com"
 
 
+def test_start_tunnel_rejects_non_tunnel_url(monkeypatch):
+    """A provider returning a dashboard/management URL must be rejected
+    BEFORE any health check runs."""
+    class FakePinggy:
+        name = "pinggy"
+
+        def available(self):
+            return True
+
+        def start(self, port, timeout):
+            return tunnel.TunnelResult(
+                provider="pinggy", url="https://dashboard.pinggy.io"
+            )
+
+    monkeypatch.setattr(tunnel, "_PROVIDERS", {"pinggy": FakePinggy})
+    # If the URL were probed, this would return True — it must never be called.
+    monkeypatch.setattr(tunnel, "wait_for_public_url", lambda url, proc: True)
+    result = tunnel.start_tunnel(8765, provider="pinggy", timeout=1)
+    assert result.url == ""
+    assert "hostname rules" in result.error
+
+
 # ── URL verification ─────────────────────────────────────────────────────────
 
+def _http_error(code, body=b""):
+    """Build an HTTPError whose body can be read (like a real urlopen 4xx)."""
+    return urllib.error.HTTPError(
+        "https://x/mcp", code, "err", {}, io.BytesIO(body)
+    )
+
+
 def test_verify_url_401_counts_reachable(monkeypatch):
-    """401 (auth working) must count as reachable."""
+    """401 with the MCP JSON body (auth working) must count as reachable."""
     def fake_urlopen(req, timeout):
-        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", None, None)
+        raise _http_error(401, b'{"error": "Unauthorized"}')
 
     monkeypatch.setattr(tunnel.urllib.request, "urlopen", fake_urlopen)
     assert tunnel.verify_url("https://x.trycloudflare.com") is True
 
 
-def test_verify_url_200_reachable(monkeypatch):
+def test_verify_url_401_wrong_body_fails(monkeypatch):
+    """A third-party 401 (non-MCP body) must NOT count as reachable."""
+    def fake_urlopen(req, timeout):
+        raise _http_error(401, b"<html>Unauthorized</html>")
+
+    monkeypatch.setattr(tunnel.urllib.request, "urlopen", fake_urlopen)
+    assert tunnel.verify_url("https://x.trycloudflare.com") is False
+
+
+def test_verify_url_200_not_mcp_fails(monkeypatch):
+    """200 (dashboard/app HTML) must NOT count as the MCP endpoint."""
     class FakeResp:
         def __enter__(self):
             return self
@@ -238,7 +322,25 @@ def test_verify_url_200_reachable(monkeypatch):
         return FakeResp()
 
     monkeypatch.setattr(tunnel.urllib.request, "urlopen", fake_urlopen)
-    assert tunnel.verify_url("https://x.trycloudflare.com") is True
+    assert tunnel.verify_url("https://x.trycloudflare.com") is False
+
+
+def test_verify_url_404_dashboard_fails(monkeypatch):
+    """404 (e.g. Pinggy dashboard /mcp) must NOT count as reachable."""
+    def fake_urlopen(req, timeout):
+        raise _http_error(404, b"<html>Not Found</html>")
+
+    monkeypatch.setattr(tunnel.urllib.request, "urlopen", fake_urlopen)
+    assert tunnel.verify_url("https://dashboard.pinggy.io") is False
+
+
+def test_verify_url_301_redirect_fails(monkeypatch):
+    """301 redirect to the official site must NOT count as reachable."""
+    def fake_urlopen(req, timeout):
+        raise _http_error(301, b"")
+
+    monkeypatch.setattr(tunnel.urllib.request, "urlopen", fake_urlopen)
+    assert tunnel.verify_url("https://x.trycloudflare.com") is False
 
 
 def test_verify_url_unreachable(monkeypatch):
@@ -256,7 +358,7 @@ def test_verify_url_probes_mcp_endpoint(monkeypatch):
     def fake_urlopen(req, timeout):
         seen["url"] = req.full_url
         seen["auth"] = req.get_header("Authorization")
-        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", None, None)
+        raise _http_error(401, b'{"error": "Unauthorized"}')
 
     monkeypatch.setattr(tunnel.urllib.request, "urlopen", fake_urlopen)
     assert tunnel.verify_url("https://x.trycloudflare.com") is True
@@ -267,7 +369,7 @@ def test_verify_url_probes_mcp_endpoint(monkeypatch):
 def test_verify_url_530_unreachable(monkeypatch):
     """Cloudflare 530 (origin unreachable) must count as unreachable."""
     def fake_urlopen(req, timeout):
-        raise urllib.error.HTTPError(req.full_url, 530, "Origin DNS error", None, None)
+        raise _http_error(530, b"")
 
     monkeypatch.setattr(tunnel.urllib.request, "urlopen", fake_urlopen)
     assert tunnel.verify_url("https://x.trycloudflare.com") is False
