@@ -157,3 +157,184 @@ def test_doctor_runs_without_crashing(capsys):
     out = capsys.readouterr().out
     assert "PASS" in out or "WARN" in out or "FAIL" in out
     assert rc in (0, 1)
+
+
+# ── restart semantics (server/tunnel lifecycle decoupling) ───────────────────
+
+def test_restart_tunnel_action_default_is_keep():
+    args = cli._parse_args(["restart"])
+    assert cli._restart_tunnel_action(args) == "keep"
+
+
+def test_restart_tunnel_action_explicit_rebuild():
+    for choice in ("auto", "pinggy", "cloudflare", "localhost-run", "none"):
+        args = cli._parse_args(["restart", "--tunnel", choice])
+        assert cli._restart_tunnel_action(args) == "rebuild"
+
+
+def test_restart_tunnel_action_no_tunnel_stops():
+    args = cli._parse_args(["restart", "--no-tunnel"])
+    assert cli._restart_tunnel_action(args) == "stop"
+
+
+@pytest.fixture
+def restart_mocks(monkeypatch):
+    """Mock process + cmd_start so restart semantics are testable without
+    spawning real subprocesses or sleeping."""
+    calls = {"killed": [], "started": [], "cleared_url": 0}
+    monkeypatch.setattr(process, "is_running", lambda: True)
+    monkeypatch.setattr(process, "read_pid", lambda: 1111)
+    monkeypatch.setattr(process, "stop_server", lambda timeout=10.0: True)
+    monkeypatch.setattr(process, "clear_pid", lambda: None)
+    monkeypatch.setattr(process, "tunnel_is_running", lambda: True)
+    monkeypatch.setattr(process, "read_tunnel_pid", lambda: 2222)
+    monkeypatch.setattr(
+        process, "kill_pid",
+        lambda pid, timeout=5.0: calls["killed"].append(pid) or True,
+    )
+    monkeypatch.setattr(process, "clear_tunnel_pid", lambda: None)
+    monkeypatch.setattr(
+        cli, "clear_public_url",
+        lambda: calls.__setitem__("cleared_url", calls["cleared_url"] + 1),
+    )
+    monkeypatch.setattr(
+        cli, "cmd_start",
+        lambda args: calls["started"].append(args) or 0,
+    )
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    return calls
+
+
+def test_restart_default_keeps_tunnel_and_public_url(restart_mocks, capsys):
+    rc = cli.cmd_restart(cli._parse_args(["restart"]))
+    out = capsys.readouterr().out
+    assert rc == 0
+    # server-only: tunnel PID untouched, public URL not cleared
+    assert restart_mocks["killed"] == []
+    assert restart_mocks["cleared_url"] == 0
+    assert "Tunnel kept (pid 2222)" in out
+    # server restarted without touching the tunnel
+    assert len(restart_mocks["started"]) == 1
+    assert restart_mocks["started"][0].no_tunnel is True
+
+
+def test_restart_rebuild_stops_tunnel_and_starts_new(restart_mocks, capsys):
+    rc = cli.cmd_restart(cli._parse_args(["restart", "--tunnel", "auto"]))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert restart_mocks["killed"] == [2222]
+    assert restart_mocks["cleared_url"] == 1
+    assert "Tunnel stopped (pid 2222)" in out
+    assert len(restart_mocks["started"]) == 1
+    assert restart_mocks["started"][0].no_tunnel is False
+    assert restart_mocks["started"][0].tunnel == "auto"
+
+
+def test_restart_no_tunnel_stops_tunnel(restart_mocks, capsys):
+    rc = cli.cmd_restart(cli._parse_args(["restart", "--no-tunnel"]))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert restart_mocks["killed"] == [2222]
+    assert restart_mocks["cleared_url"] == 1
+    assert len(restart_mocks["started"]) == 1
+    assert restart_mocks["started"][0].no_tunnel is True
+
+
+def test_restart_keep_clears_stale_public_url_when_tunnel_dead(monkeypatch, capsys):
+    """keep mode with a dead tunnel must not leave a stale public URL."""
+    calls = {"cleared_url": 0}
+    monkeypatch.setattr(process, "is_running", lambda: False)
+    monkeypatch.setattr(process, "clear_pid", lambda: None)
+    monkeypatch.setattr(process, "tunnel_is_running", lambda: False)
+    monkeypatch.setattr(process, "clear_tunnel_pid", lambda: None)
+    monkeypatch.setattr(
+        cli, "clear_public_url",
+        lambda: calls.__setitem__("cleared_url", calls["cleared_url"] + 1),
+    )
+    monkeypatch.setattr(cli, "cmd_start", lambda args: 0)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    rc = cli.cmd_restart(cli._parse_args(["restart"]))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert calls["cleared_url"] == 1
+    assert "No running tunnel to keep." in out
+
+
+def test_restart_stale_server_pid_handled(monkeypatch, capsys):
+    """A stale server PID must not crash restart; it just reports stopped."""
+    calls = {"cleared_pid": 0}
+    monkeypatch.setattr(process, "is_running", lambda: False)
+    monkeypatch.setattr(
+        process, "clear_pid",
+        lambda: calls.__setitem__("cleared_pid", calls["cleared_pid"] + 1),
+    )
+    monkeypatch.setattr(process, "tunnel_is_running", lambda: True)
+    monkeypatch.setattr(process, "read_tunnel_pid", lambda: 2222)
+    monkeypatch.setattr(process, "kill_pid", lambda pid, timeout=5.0: True)
+    monkeypatch.setattr(process, "clear_tunnel_pid", lambda: None)
+    monkeypatch.setattr(cli, "cmd_start", lambda args: 0)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    rc = cli.cmd_restart(cli._parse_args(["restart"]))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert calls["cleared_pid"] == 1
+    assert "Server is not running." in out
+
+
+# ── profile isolation (TERMUX_MCP_PROFILE) ───────────────────────────────────
+
+def _profile_probe(profile=None, extra_env=None):
+    """Run a subprocess that prints config dirs/ports for a profile."""
+    import json
+    import subprocess
+    import sys
+
+    code = (
+        "import json;"
+        "from termux_mcp import config;"
+        "print(json.dumps({"
+        "'config_dir': config.CONFIG_DIR,"
+        "'state_dir': config.STATE_DIR,"
+        "'port': config.PORT,"
+        "'mcp_port': config.MCP_PORT,"
+        "'public_url_file': config.PUBLIC_URL_FILE,"
+        "'config_file': config.CONFIG_FILE,"
+        "}))"
+    )
+    env = os.environ.copy()
+    env.pop("TERMUX_MCP_MCP_PORT", None)
+    env.pop("TERMUX_MCP_PORT", None)
+    env.pop("TERMUX_MCP_PROFILE", None)
+    if profile is not None:
+        env["TERMUX_MCP_PROFILE"] = profile
+    if extra_env:
+        env.update(extra_env)
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, check=True, env=env,
+    ).stdout
+    return json.loads(out.strip().splitlines()[-1])
+
+
+def test_profile_isolation_separate_dirs_and_ports():
+    dev = _profile_probe("dev")
+    assert dev["config_dir"].endswith("termux-mcp-dev")
+    assert dev["state_dir"].endswith("termux-mcp-dev")
+    assert dev["port"] == 18080
+    assert dev["mcp_port"] == 18765
+    assert os.path.dirname(dev["public_url_file"]).endswith("termux-mcp-dev")
+    assert os.path.dirname(dev["config_file"]).endswith("termux-mcp-dev")
+
+
+def test_profile_isolation_default_ports_without_profile():
+    stable = _profile_probe(None)
+    assert stable["config_dir"].endswith("termux-mcp")
+    assert stable["state_dir"].endswith("termux-mcp")
+    assert stable["port"] == 8080
+    assert stable["mcp_port"] == 8765
+
+
+def test_profile_isolation_explicit_env_still_wins():
+    dev = _profile_probe("dev", extra_env={"TERMUX_MCP_PORT": "9999"})
+    assert dev["port"] == 9999
+    assert dev["mcp_port"] == 18765  # profile default for the MCP port

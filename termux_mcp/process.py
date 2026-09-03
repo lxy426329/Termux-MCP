@@ -17,9 +17,15 @@ import sys
 import time
 from typing import Optional
 
-from .config import HOME
+from .config import STATE_DIR
 
-STATE_DIR: str = os.path.join(HOME, ".local", "state", "termux-mcp")
+# State lives under the profile-aware XDG-style state dir
+# (~/.local/state/termux-mcp[-<profile>]/):
+#   server.pid   — PID of the running `python -m termux_mcp` server
+#   tunnel.pid   — PID of the active tunnel process (if any)
+#   server.log   — captured stdout/stderr of the server
+#   tunnel.log   — captured stdout/stderr of the tunnel process
+
 PID_FILE: str = os.path.join(STATE_DIR, "server.pid")
 TUNNEL_PID_FILE: str = os.path.join(STATE_DIR, "tunnel.pid")
 LOG_FILE: str = os.path.join(STATE_DIR, "server.log")

@@ -4,7 +4,7 @@ Commands:
   termux-mcp                          Run the server in the foreground (default).
   termux-mcp start [--tunnel MODE]    Start server + optional public tunnel.
   termux-mcp stop                     Stop the running server (and tunnel).
-  termux-mcp restart [--tunnel MODE]  Restart server (+ tunnel).
+  termux-mcp restart [--tunnel MODE]  Restart the server (tunnel kept by default).
   termux-mcp status                   Show server / tunnel / auth status.
   termux-mcp logs [-n N]              Show recent server logs.
   termux-mcp doctor                   Run self-checks (PASS/WARN/FAIL).
@@ -13,11 +13,17 @@ Commands:
 `start` is the one-command experience: it ensures an auth token exists,
 starts the server, waits for REST + MCP health, starts the selected tunnel,
 verifies the public URL, and prints the final MCP URL.
+
+`restart` is server-only by default: the running tunnel, its PID and the
+verified public URL are preserved so ChatGPT's saved MCP URL stays valid
+even though anonymous tunnel hostnames change between tunnel rebuilds.
+Pass --tunnel <mode> to rebuild the tunnel, or --no-tunnel to stop it.
 """
 
 import argparse
 import os
 import sys
+import time
 from typing import List, Optional
 
 from . import __version__
@@ -62,14 +68,14 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     sub.add_parser("stop", help="Stop the running server and tunnel")
 
-    p_restart = sub.add_parser("restart", help="Restart the server")
+    p_restart = sub.add_parser("restart", help="Restart the server (tunnel kept by default)")
     p_restart.add_argument(
-        "--tunnel", default="auto", choices=TUNNEL_CHOICES,
-        help="Tunnel provider (default: auto)",
+        "--tunnel", default=None, choices=TUNNEL_CHOICES,
+        help="Rebuild the tunnel with this provider (default: keep the running tunnel)",
     )
     p_restart.add_argument(
         "--no-tunnel", action="store_true",
-        help="Restart without any public tunnel",
+        help="Stop the tunnel and restart the server without one",
     )
 
     sub.add_parser("status", help="Show server / tunnel / auth status")
@@ -167,12 +173,72 @@ def cmd_stop() -> int:
     return 0
 
 
+def _restart_tunnel_action(args: argparse.Namespace) -> str:
+    """Decide how restart handles the tunnel: keep | rebuild | stop.
+
+    Default is "keep" (server-only restart): the running tunnel and its
+    verified public URL are preserved so ChatGPT's saved MCP URL stays
+    valid. Explicit --tunnel <mode> rebuilds the tunnel; --no-tunnel
+    stops it. `restart --tunnel auto` keeps the old "stop everything and
+    rebuild" behavior.
+    """
+    if args.no_tunnel:
+        return "stop"
+    if args.tunnel is not None:
+        return "rebuild"
+    return "keep"
+
+
 def cmd_restart(args: argparse.Namespace) -> int:
-    cmd_stop()
+    action = _restart_tunnel_action(args)
+
+    # 1. Stop the server only — never touch the tunnel unless asked.
+    if process.is_running():
+        pid = process.read_pid()
+        process.stop_server()
+        print(f"Server stopped (pid {pid})")
+    else:
+        process.clear_pid()
+        print("Server is not running.")
+
+    # 2. Tunnel handling per the requested action.
+    if action in ("rebuild", "stop"):
+        if process.tunnel_is_running():
+            tpid = process.read_tunnel_pid()
+            process.kill_pid(tpid)
+            process.clear_tunnel_pid()
+            print(f"Tunnel stopped (pid {tpid})")
+        else:
+            process.clear_tunnel_pid()
+        # The old public URL is no longer valid once the tunnel is gone.
+        clear_public_url()
+    else:  # keep
+        if process.tunnel_is_running():
+            print(f"Tunnel kept (pid {process.read_tunnel_pid()})")
+            pub = get_public_url()
+            if pub:
+                print(f"Public MCP URL kept: {pub}/mcp")
+        else:
+            # No live tunnel — drop any stale public URL so the restarted
+            # server does not advertise a dead endpoint.
+            clear_public_url()
+            print("No running tunnel to keep.")
+
     # Small pause so the ports are released before rebinding.
-    import time
     time.sleep(1)
-    return cmd_start(args)
+
+    # 3. Start the server. Rebuild passes the requested provider; keep/stop
+    # start without touching the tunnel (a kept tunnel still forwards to the
+    # same MCP port, and the persisted public_url is re-read by the server's
+    # transport-security watcher on startup).
+    start_args = argparse.Namespace()
+    if action == "rebuild":
+        start_args.no_tunnel = False
+        start_args.tunnel = args.tunnel
+    else:
+        start_args.no_tunnel = True
+        start_args.tunnel = "none"
+    return cmd_start(start_args)
 
 
 def cmd_status() -> int:

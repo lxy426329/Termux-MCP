@@ -197,3 +197,28 @@ def test_watcher_picks_up_runtime_url(isolated_public_url, monkeypatch):
         assert _LOCALHOST_HOSTS[0] in settings.allowed_hosts
     finally:
         config.clear_public_url()
+
+
+# ── Lifecycle: server-only restart restores the persisted public URL ─────────
+
+def test_restart_restores_public_url_allowed_host_and_issuer(
+    isolated_public_url, monkeypatch
+):
+    """After a server-only restart the persisted public URL is re-read:
+    the tunnel host is trusted again and OAuth discovery resolves to it."""
+    from termux_mcp import mcp_server, oauth
+
+    monkeypatch.setattr(config, "OAUTH_ISSUER", "auto")
+    # Simulate the CLI keeping a verified tunnel URL across a restart.
+    config.set_public_url("https://abc123.free.pinggy.net")
+    try:
+        app = _build_mcp_app()  # fresh server process reads the persisted URL
+        settings = mcp_server._transport_security
+        assert "abc123.free.pinggy.net" in settings.allowed_hosts
+        assert "abc123.free.pinggy.net:*" in settings.allowed_hosts
+        assert _LOCALHOST_HOSTS[0] in settings.allowed_hosts
+        # OAuth discovery resolves to the restored runtime URL.
+        assert oauth.get_issuer() == "https://abc123.free.pinggy.net"
+        assert oauth.get_resource_url() == "https://abc123.free.pinggy.net/mcp"
+    finally:
+        config.clear_public_url()

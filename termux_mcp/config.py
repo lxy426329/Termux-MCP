@@ -15,8 +15,16 @@ import secrets
 
 HOME: str = os.environ.get("HOME", "/data/data/com.termux/files/home")
 
-CONFIG_DIR: str = os.path.join(HOME, ".config", "termux-mcp")
+# Profile isolation: TERMUX_MCP_PROFILE=<name> runs a fully separate instance
+# (config dir, state dir, default ports) so a stable and a dev/test instance
+# can coexist on one device without clobbering each other's PID / log /
+# public_url / token / OAuth state. Explicit TERMUX_MCP_* env vars still win.
+PROFILE: str = os.environ.get("TERMUX_MCP_PROFILE", "").strip()
+_PROFILE_SUFFIX = f"-{PROFILE}" if PROFILE else ""
+
+CONFIG_DIR: str = os.path.join(HOME, ".config", f"termux-mcp{_PROFILE_SUFFIX}")
 CONFIG_FILE: str = os.path.join(CONFIG_DIR, "config.env")
+STATE_DIR: str = os.path.join(HOME, ".local", "state", f"termux-mcp{_PROFILE_SUFFIX}")
 
 
 def _load_config_file() -> dict:
@@ -69,7 +77,12 @@ def _write_config(updates: dict) -> None:
     _FILE_VALUES.update(values)
 
 
-PORT: int = int(_env_or_file("TERMUX_MCP_PORT", "8080"))
+# Default ports shift by +10000 when a profile is active so a dev/test
+# instance never collides with the stable one. Explicit TERMUX_MCP_PORT /
+# TERMUX_MCP_MCP_PORT (env or profile config file) still win.
+_DEFAULT_PORT = "18080" if PROFILE else "8080"
+_DEFAULT_MCP_PORT = "18765" if PROFILE else "8765"
+PORT: int = int(_env_or_file("TERMUX_MCP_PORT", _DEFAULT_PORT))
 HOST: str = _env_or_file("TERMUX_MCP_HOST", "127.0.0.1")
 
 # Command timeout in seconds. 0 (default) = NO timeout — long operations
@@ -98,8 +111,8 @@ OAUTH_SCOPES: str = _env_or_file("TERMUX_MCP_OAUTH_SCOPES", "mcp:read mcp:write"
 
 # Runtime public URL, written by the launcher after a tunnel starts so the
 # server process (a separate subprocess) can serve correct OAuth metadata
-# without trusting Host/X-Forwarded-* headers.
-PUBLIC_URL_FILE: str = os.path.join(HOME, ".local", "state", "termux-mcp", "public_url")
+# without trusting Host/X-Forwarded-* headers. Profile-aware via STATE_DIR.
+PUBLIC_URL_FILE: str = os.path.join(STATE_DIR, "public_url")
 
 
 def set_public_url(url: str) -> None:
@@ -147,7 +160,7 @@ MCP_ENABLED: bool = _env_or_file("TERMUX_MCP_MCP_ENABLED", "1").lower() in (
     "1", "true", "yes", "on",
 )
 MCP_HOST: str = _env_or_file("TERMUX_MCP_MCP_HOST", HOST)
-MCP_PORT: int = int(_env_or_file("TERMUX_MCP_MCP_PORT", "8765"))
+MCP_PORT: int = int(_env_or_file("TERMUX_MCP_MCP_PORT", _DEFAULT_MCP_PORT))
 
 # Optional workspace root for MCP filesystem tools. When set, MCP
 # read_file/write_file/list_files/make_directory are restricted to paths

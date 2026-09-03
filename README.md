@@ -15,6 +15,9 @@ This fork adds a minimal, standards-compliant **MCP (Model Context Protocol)** l
 - **Preserved upstream security behavior**: risk classification (`get_risk_assessment()`), dangerous commands blocked, warning commands require confirmation, snapshot-before-write, trash-on-delete.
 - **Structured tool responses**: `run_command` returns `stdout`, `stderr`, `exit_code`, `truncated`, `risk_level`, `snapshots`; `read_file` supports `offset`/`limit`.
 - **One-command launcher**: `termux-mcp start` starts the server, waits for health, opens a public tunnel, and prints the final MCP URL. Also `stop` / `restart` / `status` / `logs` / `doctor` / `token`.
+- **Server/tunnel lifecycle decoupling**: `termux-mcp restart` is **server-only by default** — the running tunnel, its PID and the verified public URL are preserved, so ChatGPT's saved MCP URL stays valid even though anonymous tunnel hostnames change between rebuilds. `restart --tunnel <mode>` rebuilds the tunnel; `restart --no-tunnel` stops it.
+- **OAuth state persistence**: registered clients and refresh/access tokens survive server restarts (`~/.config/termux-mcp/oauth_state.json`, chmod 600, atomic writes). Authorization codes are never persisted. A server-only restart does not force ChatGPT to re-authorize.
+- **Profile isolation**: `TERMUX_MCP_PROFILE=<name>` runs a fully separate instance (config dir, state dir, default ports) so a stable and a dev/test instance can coexist on one device without clobbering each other's PID / log / public_url / token / OAuth state.
 - **Multi-tunnel support**: pinggy / cloudflare / localhost.run with automatic fallback (`--tunnel auto`).
 - **Persistent config**: `~/.config/termux-mcp/config.env` (chmod 600), token auto-generated on first start.
 - **Tests**: MCP authentication, workspace path traversal / symlink escape, dangerous & warning shell commands, REST/MCP shared-logic proof, launcher/tunnel/config unit tests, and a `tools/list` + `tools/call` smoke test.
@@ -148,7 +151,8 @@ termux-mcp restart --tunnel cloudflare
 termux-mcp restart --tunnel localhost-run
 ```
 
-- `--tunnel auto`（默认）会自动按顺序尝试可用的隧道，卡住就换下一个。
+- `start` 的 `--tunnel auto`（默认）会自动按顺序尝试可用的隧道，卡住就换下一个。
+- **`restart` 默认只重启服务器，不会动隧道**：正在运行的隧道、它的 PID 和已验证的公网 URL 都会保留，所以 ChatGPT 里保存的 MCP URL 不会失效。只有显式加 `--tunnel`（重建隧道）或 `--no-tunnel`（停止隧道）才会动隧道。
 
 ## 第 11 步：如何连接 MCP 客户端
 
@@ -198,7 +202,9 @@ termux-mcp restart
 | `termux-mcp start --no-tunnel` | 只启动本地服务器 |
 | `termux-mcp start --tunnel cloudflare` | 指定隧道启动 |
 | `termux-mcp stop` | 停止服务器和隧道 |
-| `termux-mcp restart` | 重启（可加 `--tunnel`） |
+| `termux-mcp restart` | 只重启服务器（**保留**正在运行的隧道和公网 URL） |
+| `termux-mcp restart --tunnel auto` | 重启服务器并**重建**隧道（旧行为） |
+| `termux-mcp restart --no-tunnel` | 重启服务器并停止隧道 |
 | `termux-mcp status` | 查看运行状态 |
 | `termux-mcp logs` | 查看日志（`-n 100` 看更多） |
 | `termux-mcp doctor` | 自检（PASS/WARN/FAIL） |
@@ -221,6 +227,23 @@ termux-mcp restart
 | `TERMUX_MCP_MAX_OUTPUT` | `20000` | 输出上限字节 |
 | `TERMUX_MCP_TUNNEL_PROVIDERS` | `pinggy,cloudflare,localhost-run` | auto 模式的隧道顺序 |
 | `TERMUX_MCP_TUNNEL_TIMEOUT` | `45` | 单个隧道超时秒数 |
+| `TERMUX_MCP_PROFILE` | 空 | 实例隔离：`dev`/`test` 等名字会使用独立的 config/state 目录和默认端口（REST `18080`、MCP `18765`），与 stable 实例互不干扰 |
+
+### 多实例隔离（profile）
+
+同一台 Termux 上可以同时跑 stable 和 dev/test 实例，互不抢端口、PID、日志、public_url 和配置：
+
+```bash
+# stable 实例（默认）
+termux-mcp start
+
+# dev 实例：独立目录 + 独立默认端口
+TERMUX_MCP_PROFILE=dev termux-mcp start --no-tunnel
+TERMUX_MCP_PROFILE=dev termux-mcp status
+```
+
+- 带 profile 的实例使用 `~/.config/termux-mcp-<name>/` 和 `~/.local/state/termux-mcp-<name>/`，默认端口偏移到 `18080` / `18765`。
+- 显式设置 `TERMUX_MCP_PORT` / `TERMUX_MCP_MCP_PORT`（环境变量或该 profile 的 config.env）仍然优先。
 
 # Security & Deployment
 
@@ -246,7 +269,7 @@ termux-mcp restart
 
 # OAuth
 
-Static Bearer token is the current auth mode. A standards-compliant MCP OAuth 2.0 flow is planned but not implemented — see [docs/oauth.md](docs/oauth.md) for the exact roadmap. The auth layer is already abstracted (`termux_mcp/auth.py`) so OAuth can be added without touching request handlers.
+Static Bearer token is the default auth mode. A standards-compliant **OAuth 2.0 (authorization-code + PKCE)** flow is also implemented and verified end-to-end on a real device (ChatGPT → OAuth → tunnel → Termux-MCP): set `TERMUX_MCP_OAUTH_ISSUER=auto` (or a concrete URL) to enable it. The server self-hosts the authorization server (RFC 6749 + RFC 7636 + RFC 7591 + RFC 7009) and serves RFC 9728 protected-resource metadata + RFC 8414 AS metadata. Registered clients and refresh/access tokens are persisted (`~/.config/termux-mcp/oauth_state.json`, chmod 600) so a server-only `restart` does **not** force ChatGPT to re-authorize. See [docs/oauth.md](docs/oauth.md) for details.
 
 # Troubleshooting
 
@@ -264,7 +287,7 @@ Static Bearer token is the current auth mode. A standards-compliant MCP OAuth 2.
 | tunnel timeout | 网络/VPN 问题 | `termux-mcp restart --tunnel pinggy` 换隧道；关 VPN 重试 |
 | cloudflared precheck 卡住 | cloudflared 在部分网络卡住 | 用 `--tunnel pinggy` 或 `--tunnel localhost-run` |
 | SSH password prompt | 隧道需要交互认证 | 换 pinggy（`--tunnel pinggy`） |
-| Pinggy URL 变化 | 免费隧道每次重启 URL 会变 | 每次 `start` 后重新复制 URL 到客户端 |
+| Pinggy URL 变化 | 免费隧道每次**重建** URL 会变 | 普通 `termux-mcp restart` 会保留隧道和 URL，不用重新复制；只有 `restart --tunnel ...` 重建后才需要更新客户端 |
 | Android 杀后台 | 系统回收了 Termux 进程 | 用 `termux-wake-lock` 保持唤醒；或 Termux 设置里允许后台运行 |
 | 网络/VPN 导致 tunnel 失败 | 运营商/VPN 限制 | 换网络、关 VPN、换隧道 |
 

@@ -112,9 +112,15 @@ and no discovery endpoints are advertised.
 - Unsupported grant types are rejected.
 - No tokens in URL query parameters; no plaintext secrets logged.
 - Constant-time comparison (`hmac.compare_digest`) for the static token.
-- All AS state (clients, codes, tokens) is **in-memory only** — nothing is
-  persisted to disk, so a server restart invalidates outstanding tokens.
-  This is intentional for the minimal self-hosted flow.
+- **Persistent AS state**: registered clients and refresh/access tokens are
+  persisted to `~/.config/termux-mcp/oauth_state.json` (chmod 0600, atomic
+  write via temp file + `os.replace`, guarded by a lock). A server-only
+  `termux-mcp restart` therefore does **not** invalidate an established
+  OAuth session — the client can keep refreshing without re-authorizing.
+- **Authorization codes are never persisted**: they are short-lived (60 s),
+  one-time, and kept in memory only, so an in-flight flow is not resumable
+  across a restart — only established sessions survive.
+- Expired refresh/access tokens are dropped on load and on use.
 - OAuth mode never silently disables authentication: when enabled, `/mcp`
   requires a valid static token or OAuth access token.
 
@@ -148,10 +154,28 @@ curl -i https://xxxxx.free.pinggy.net/mcp   # expect 401 + WWW-Authenticate
 ## ChatGPT / custom MCP clients
 
 The server implements the OAuth discovery + authorization-code + PKCE flow
-that MCP clients are expected to use. **ChatGPT compatibility has not been
-verified on a real device / public client yet** — do not claim it until a
-real-device validation has happened. The static Bearer token remains the
+that MCP clients are expected to use. The full chain
+**ChatGPT → OAuth → Pinggy tunnel → Termux-MCP → Android** has been
+verified end-to-end on a real device. The static Bearer token remains the
 verified path for clients that support custom headers.
+
+## Restart survival
+
+Anonymous tunnel hostnames change whenever the tunnel is rebuilt, but a
+plain `termux-mcp restart` is **server-only**: the running tunnel, its PID
+and the verified public URL are preserved, so ChatGPT's saved MCP URL stays
+valid. On startup the server re-reads the persisted public URL
+(`~/.local/state/termux-mcp/public_url`) and restores:
+
+- the FastMCP DNS-rebinding `allowed_hosts` entry for the tunnel host
+  (seeded at app build and kept in sync by the watcher thread), and
+- the OAuth issuer / protected-resource metadata when
+  `TERMUX_MCP_OAUTH_ISSUER=auto` (resolved from the same runtime URL).
+
+Registered clients and refresh/access tokens are restored from
+`~/.config/termux-mcp/oauth_state.json`, so the client does not need to
+re-authorize. Only `termux-mcp restart --tunnel <mode>` (rebuild) or
+`--no-tunnel` (stop) changes the public URL.
 
 ## SDK / spec assumptions
 

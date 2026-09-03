@@ -18,10 +18,16 @@ metadata stays correct even though tunnel URLs change on restart.
 
 All metadata handlers resolve the public URL / issuer at request time and
 never trust Host / X-Forwarded-* headers. No tokens or client secrets are
-ever logged or persisted to disk (state is in-memory only).
+ever logged. Registered clients and refresh/access tokens are persisted to
+~/.config/termux-mcp/oauth_state.json (chmod 0600) so a server restart does
+not invalidate an established OAuth session; authorization codes are never
+persisted.
 """
 
+import json
+import os
 import secrets
+import threading
 import time
 from typing import List, Optional
 from urllib.parse import urlparse
@@ -31,6 +37,11 @@ from . import config
 # OAuth discovery / authorization-server endpoints that must be reachable
 # without a Bearer token so MCP clients can complete the OAuth flow.
 _PUBLIC_PATHS = {"/authorize", "/token", "/register", "/revoke"}
+
+# Persistent OAuth state (registered clients + refresh/access tokens) so a
+# server restart does not force clients to re-authorize. Authorization codes
+# are NEVER persisted. The file is chmod 0600 and written atomically.
+_OAUTH_STATE_FILE: str = os.path.join(config.CONFIG_DIR, "oauth_state.json")
 
 
 def oauth_enabled() -> bool:
@@ -115,13 +126,13 @@ def _valid_http_url(url: str) -> bool:
 # ── Authorization Server provider ────────────────────────────────────────────
 
 class InMemoryAuthProvider:
-    """In-memory OAuth Authorization Server (RFC 6749 + RFC 7636).
+    """OAuth Authorization Server (RFC 6749 + RFC 7636) with disk persistence.
 
     Implements the `mcp` SDK's OAuthAuthorizationServerProvider protocol.
-    All state (clients, authorization codes, access/refresh tokens) lives
-    in memory: a server restart invalidates outstanding codes and tokens.
-    This is intentional for the minimal self-hosted flow — no tokens or
-    client secrets are ever persisted to disk.
+    Registered clients and refresh/access tokens are persisted to a chmod-0600
+    JSON file so a server restart does not invalidate an established OAuth
+    session (the client can keep refreshing without re-authorizing).
+    Authorization codes are short-lived, one-time, and NEVER persisted.
     """
 
     def __init__(
@@ -130,6 +141,7 @@ class InMemoryAuthProvider:
         code_ttl: float = 60.0,
         access_ttl: int = 3600,
         refresh_ttl: int = 7 * 24 * 3600,
+        state_file: Optional[str] = None,
     ):
         self._scopes = scopes
         self._code_ttl = code_ttl
@@ -139,12 +151,85 @@ class InMemoryAuthProvider:
         self._codes = {}
         self._refresh_tokens = {}
         self._access_tokens = {}
+        self._state_file = state_file or _OAUTH_STATE_FILE
+        self._lock = threading.Lock()
+        self._load_state()
+
+    # ── persistence ──────────────────────────────────────────────────────────
+
+    def _load_state(self) -> None:
+        """Restore clients + refresh/access tokens from disk (expired dropped).
+
+        Authorization codes are never stored, so an in-flight flow is not
+        resumable across a restart — only established sessions survive.
+        """
+        if not self._state_file:
+            return
+        try:
+            with open(self._state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        from mcp.server.auth.provider import AccessToken, RefreshToken
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        now = time.time()
+        for cid, raw in (data.get("clients") or {}).items():
+            try:
+                self._clients[cid] = OAuthClientInformationFull.model_validate(raw)
+            except Exception:
+                continue
+        for tok, raw in (data.get("refresh_tokens") or {}).items():
+            try:
+                rt = RefreshToken.model_validate(raw)
+            except Exception:
+                continue
+            if rt.expires_at and rt.expires_at < now:
+                continue
+            self._refresh_tokens[tok] = rt
+        for tok, raw in (data.get("access_tokens") or {}).items():
+            try:
+                at = AccessToken.model_validate(raw)
+            except Exception:
+                continue
+            if at.expires_at and at.expires_at < now:
+                continue
+            self._access_tokens[tok] = at
+
+    def _save_state(self) -> None:
+        """Persist clients + refresh/access tokens (never authorization codes)."""
+        if not self._state_file:
+            return
+        data = {
+            "clients": {
+                cid: c.model_dump(mode="json") for cid, c in self._clients.items()
+            },
+            "refresh_tokens": {
+                t: rt.model_dump(mode="json") for t, rt in self._refresh_tokens.items()
+            },
+            "access_tokens": {
+                t: at.model_dump(mode="json") for t, at in self._access_tokens.items()
+            },
+        }
+        os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
+        tmp = self._state_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, self._state_file)
+
+    # ── SDK provider protocol ────────────────────────────────────────────────
 
     async def get_client(self, client_id: str):
         return self._clients.get(client_id)
 
     async def register_client(self, client_info) -> None:
-        self._clients[client_info.client_id] = client_info
+        with self._lock:
+            self._clients[client_info.client_id] = client_info
+            self._save_state()
 
     async def authorize(self, client, params) -> str:
         """Generate a short-lived, one-time authorization code and redirect."""
@@ -175,39 +260,53 @@ class InMemoryAuthProvider:
 
     async def exchange_authorization_code(self, client, authorization_code):
         # One-time use: the code is consumed by this exchange.
-        self._codes.pop(authorization_code.code, None)
-        return self._issue_tokens(client, authorization_code.scopes, subject=authorization_code.subject)
+        with self._lock:
+            self._codes.pop(authorization_code.code, None)
+            token = self._issue_tokens(
+                client, authorization_code.scopes, subject=authorization_code.subject
+            )
+            self._save_state()
+            return token
 
     async def load_refresh_token(self, client, refresh_token: str):
-        token = self._refresh_tokens.get(refresh_token)
-        if token is None:
-            return None
-        if token.expires_at and token.expires_at < time.time():
-            self._refresh_tokens.pop(refresh_token, None)
-            return None
-        return token
+        with self._lock:
+            token = self._refresh_tokens.get(refresh_token)
+            if token is None:
+                return None
+            if token.expires_at and token.expires_at < time.time():
+                self._refresh_tokens.pop(refresh_token, None)
+                self._save_state()
+                return None
+            return token
 
     async def exchange_refresh_token(self, client, refresh_token, scopes):
         # Rotation: the presented refresh token is revoked and replaced.
-        self._refresh_tokens.pop(refresh_token.token, None)
-        return self._issue_tokens(client, scopes, subject=refresh_token.subject)
+        with self._lock:
+            self._refresh_tokens.pop(refresh_token.token, None)
+            token = self._issue_tokens(client, scopes, subject=refresh_token.subject)
+            self._save_state()
+            return token
 
     async def load_access_token(self, token: str):
-        access = self._access_tokens.get(token)
-        if access is None:
-            return None
-        if access.expires_at and access.expires_at < time.time():
-            self._access_tokens.pop(token, None)
-            return None
-        return access
+        with self._lock:
+            access = self._access_tokens.get(token)
+            if access is None:
+                return None
+            if access.expires_at and access.expires_at < time.time():
+                self._access_tokens.pop(token, None)
+                self._save_state()
+                return None
+            return access
 
     async def revoke_token(self, token) -> None:
         from mcp.server.auth.provider import AccessToken, RefreshToken
 
-        if isinstance(token, AccessToken):
-            self._access_tokens.pop(token.token, None)
-        elif isinstance(token, RefreshToken):
-            self._refresh_tokens.pop(token.token, None)
+        with self._lock:
+            if isinstance(token, AccessToken):
+                self._access_tokens.pop(token.token, None)
+            elif isinstance(token, RefreshToken):
+                self._refresh_tokens.pop(token.token, None)
+            self._save_state()
 
     def _issue_tokens(self, client, scopes, subject=None):
         from mcp.server.auth.provider import AccessToken, RefreshToken
