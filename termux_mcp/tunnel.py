@@ -7,8 +7,10 @@ Supported providers (order is configurable via TERMUX_MCP_TUNNEL_PROVIDERS):
 
 `start_tunnel(port, "auto")` tries each available provider in order, gives
 each a bounded timeout, terminates a provider that hangs, and returns the
-first public HTTPS URL that appears. Tunnel URLs are deployment-sensitive
-and are never uploaded anywhere.
+first public HTTPS URL that appears. A parsed URL is not enough: the URL
+must actually answer over the public internet (see wait_for_public_url)
+before the provider counts as successful. Tunnel URLs are
+deployment-sensitive and are never uploaded anywhere.
 """
 
 import os
@@ -43,15 +45,30 @@ _URL_PATTERNS = {
     ],
 }
 
-# Output markers that mean the tunnel needs interactive auth (fail fast).
+# Output markers that mean the tunnel needs interactive auth. In non-PTY
+# mode these fail fast; in PTY mode the password prompt is auto-answered
+# with an empty line (Pinggy / localhost.run anonymous tunnels accept it).
 _AUTH_PROMPT_MARKERS = (
     "password:",
     "Password:",
     "passphrase",
     "Enter passphrase",
+)
+
+# Output markers that mean the connection itself failed — always fatal.
+_AUTH_FAIL_MARKERS = (
     "Host key verification failed",
     "Permission denied",
 )
+
+# Matches an SSH password prompt so the PTY reader can answer it.
+_PASSWORD_PROMPT_RE = re.compile(r"(?i)password\s*[:?]")
+
+# Startup grace period for a public URL to become reachable. Cloudflare
+# quick tunnels print their URL before the edge is ready, so a single probe
+# is not enough — retry until the endpoint answers or the window expires.
+PUBLIC_URL_GRACE = 25.0
+PUBLIC_URL_RETRY_INTERVAL = 1.5
 
 
 @dataclass
@@ -82,11 +99,65 @@ def _extract_https_url(text: str, patterns: List[str]) -> Optional[str]:
     return None
 
 
+def _spawn_pty(cmd: List[str]):
+    """Spawn a subprocess attached to a PTY (POSIX only).
+
+    SSH needs a terminal to prompt for a password; Pinggy and localhost.run
+    anonymous tunnels accept an empty password. The reader thread answers
+    the prompt automatically so the launcher never blocks on human input.
+    Returns (proc, master_fd).
+    """
+    import pty
+
+    master_fd, slave_fd = pty.openpty()
+    proc = subprocess.Popen(
+        cmd,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        start_new_session=True,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    return proc, master_fd
+
+
+def _read_pty_output(master_fd: int, out_q: "queue.Queue[str]", log_f) -> None:
+    """Read PTY output, persist it, and auto-answer password prompts.
+
+    An SSH password prompt is answered with an empty line (the anonymous
+    tunnels accept it), so the process never waits for human input. The
+    response is capped so a server that keeps re-prompting cannot loop.
+    """
+    buf = ""
+    responses = 0
+    while True:
+        try:
+            data = os.read(master_fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        text = data.decode("utf-8", errors="replace")
+        buf += text
+        out_q.put(text)
+        log_f.write(text)
+        log_f.flush()
+        if responses < 3 and _PASSWORD_PROMPT_RE.search(buf):
+            buf = ""
+            responses += 1
+            try:
+                os.write(master_fd, b"\n")
+            except OSError:
+                pass
+
+
 def _run_and_wait_for_url(
     provider: str,
     cmd: List[str],
     patterns: List[str],
     timeout: int,
+    pty: bool = False,
 ) -> TunnelResult:
     """Run a tunnel command, watch its output for a public URL.
 
@@ -94,29 +165,42 @@ def _run_and_wait_for_url(
     always honored even if the tunnel process goes completely silent
     (e.g. cloudflared stuck in precheck). Every line is also appended to
     the tunnel log (~/.local/state/termux-mcp/tunnel.log) so failures can
-    be diagnosed later. stdin is /dev/null so an SSH password prompt can
-    never block the launcher. Terminates the process on timeout or when an
-    auth prompt appears.
+    be diagnosed later.
+
+    With `pty=True` (POSIX) the child runs on a pseudo-terminal: SSH can
+    prompt for a password and the reader answers it with an empty line, so
+    Pinggy/localhost.run anonymous tunnels authenticate without ever
+    blocking on human input. Without a PTY, stdin is /dev/null and any
+    auth prompt fails fast.
     """
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        text=True,
-        env=os.environ.copy(),
-    )
-    out_q: "queue.Queue[str]" = queue.Queue()
     log_path = process.TUNNEL_LOG_FILE
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    use_pty = pty and os.name == "posix"
+
+    if use_pty:
+        proc, master_fd = _spawn_pty(cmd)
+    else:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            env=os.environ.copy(),
+        )
+
+    out_q: "queue.Queue[str]" = queue.Queue()
 
     def _reader() -> None:
         try:
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, "a", encoding="utf-8", errors="replace") as log_f:
-                for line in proc.stdout:
-                    out_q.put(line)
-                    log_f.write(line)
-                    log_f.flush()
+                if use_pty:
+                    _read_pty_output(master_fd, out_q, log_f)
+                else:
+                    for line in proc.stdout:
+                        out_q.put(line)
+                        log_f.write(line)
+                        log_f.flush()
         except Exception:
             pass
 
@@ -138,16 +222,23 @@ def _run_and_wait_for_url(
                 error=f"exited early (code {proc.returncode}): {tail[-300:]}",
             )
         try:
-            line = out_q.get(timeout=0.2)
+            chunk = out_q.get(timeout=0.2)
         except queue.Empty:
             continue
-        buf += line
-        if any(marker in line for marker in _AUTH_PROMPT_MARKERS):
+        buf += chunk
+        if any(marker in buf for marker in _AUTH_FAIL_MARKERS):
             _terminate(proc)
             return TunnelResult(
                 provider=provider,
                 process=None,
-                error=f"interactive auth required: {line.strip()[:120]}",
+                error=f"auth/connection failed: {buf.strip()[-120:]}",
+            )
+        if not use_pty and any(marker in buf for marker in _AUTH_PROMPT_MARKERS):
+            _terminate(proc)
+            return TunnelResult(
+                provider=provider,
+                process=None,
+                error=f"interactive auth required: {buf.strip()[-120:]}",
             )
         url = _extract_https_url(buf, patterns)
         if url:
@@ -171,6 +262,40 @@ def _terminate(proc: subprocess.Popen) -> None:
             pass
 
 
+def _pinggy_cmd(port: int) -> List[str]:
+    """SSH argv for Pinggy, matching the on-device verified command:
+    `ssh -p 443 -o StrictHostKeyChecking=no -o ServerAliveInterval=30
+    -R0:127.0.0.1:<port> a@free.pinggy.io` plus non-interactive hardening.
+
+    No BatchMode: Pinggy's anonymous tunnel answers the password prompt
+    with an empty password, which the PTY reader supplies automatically.
+    """
+    return [
+        "ssh", "-p", "443",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ConnectTimeout=15",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "NumberOfPasswordPrompts=1",
+        "-R", f"0:127.0.0.1:{port}",
+        "a@free.pinggy.io",
+    ]
+
+
+def _localhost_run_cmd(port: int) -> List[str]:
+    """SSH argv for localhost.run (same anonymous-tunnel password handling)."""
+    return [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ConnectTimeout=15",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "NumberOfPasswordPrompts=1",
+        "-R", f"80:127.0.0.1:{port}",
+        "nokey@localhost.run",
+    ]
+
+
 class PinggyProvider(TunnelProvider):
     name = "pinggy"
 
@@ -178,21 +303,9 @@ class PinggyProvider(TunnelProvider):
         return shutil.which("ssh") is not None
 
     def start(self, port: int, timeout: int) -> TunnelResult:
-        # Non-interactive flags verified on-device:
-        #   -p 443, StrictHostKeyChecking=no, ServerAliveInterval=30,
-        #   BatchMode=yes (never prompt for a password), ConnectTimeout,
-        #   ExitOnForwardFailure, and 127.0.0.1 (avoid IPv6 localhost).
-        cmd = [
-            "ssh", "-p", "443",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ServerAliveInterval=30",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=15",
-            "-o", "ExitOnForwardFailure=yes",
-            "-R", f"0:127.0.0.1:{port}",
-            "a@free.pinggy.io",
-        ]
-        return _run_and_wait_for_url(self.name, cmd, _URL_PATTERNS[self.name], timeout)
+        return _run_and_wait_for_url(
+            self.name, _pinggy_cmd(port), _URL_PATTERNS[self.name], timeout, pty=True
+        )
 
 
 class CloudflareProvider(TunnelProvider):
@@ -213,17 +326,13 @@ class LocalhostRunProvider(TunnelProvider):
         return shutil.which("ssh") is not None
 
     def start(self, port: int, timeout: int) -> TunnelResult:
-        cmd = [
-            "ssh",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ServerAliveInterval=30",
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=15",
-            "-o", "ExitOnForwardFailure=yes",
-            "-R", f"80:127.0.0.1:{port}",
-            "nokey@localhost.run",
-        ]
-        return _run_and_wait_for_url(self.name, cmd, _URL_PATTERNS[self.name], timeout)
+        return _run_and_wait_for_url(
+            self.name,
+            _localhost_run_cmd(port),
+            _URL_PATTERNS[self.name],
+            timeout,
+            pty=True,
+        )
 
 
 _PROVIDERS = {
@@ -248,8 +357,9 @@ def start_tunnel(
     `provider="auto"` tries each configured provider in order
     (TERMUX_MCP_TUNNEL_PROVIDERS), skipping unavailable ones and falling
     back on timeout/failure. A provider only counts as successful once its
-    public URL is actually reachable (see verify_url) — a parsed URL that
-    does not answer (e.g. Cloudflare 530) is treated as a failure.
+    public URL is actually reachable (see wait_for_public_url) — a parsed
+    URL that never answers (e.g. Cloudflare 530) is treated as a failure
+    and the provider is terminated.
     """
     timeout = timeout or TUNNEL_TIMEOUT
     last_error = ""
@@ -260,11 +370,20 @@ def start_tunnel(
                 continue
             result = p.start(port, timeout)
             if result.url:
-                if verify_url(result.url):
+                if wait_for_public_url(result.url, result.process):
                     return result
+                if result.process and result.process.poll() is not None:
+                    last_error = (
+                        f"{name}: tunnel exited during startup "
+                        f"(code {result.process.returncode})"
+                    )
+                else:
+                    last_error = (
+                        f"{name}: public URL not reachable within "
+                        f"{PUBLIC_URL_GRACE:.0f}s: {result.url}"
+                    )
                 if result.process:
                     _terminate(result.process)
-                last_error = f"{name}: public URL not reachable: {result.url}"
                 continue
             last_error = f"{name}: {result.error}"
         return TunnelResult(
@@ -280,14 +399,48 @@ def start_tunnel(
             error=f"{provider} is not installed (install ssh/cloudflared)",
         )
     result = p.start(port, timeout)
-    if result.url and not verify_url(result.url):
+    if result.url:
+        if wait_for_public_url(result.url, result.process):
+            return result
+        if result.process and result.process.poll() is not None:
+            return TunnelResult(
+                provider=provider,
+                error=f"tunnel exited during startup (code {result.process.returncode})",
+            )
         if result.process:
             _terminate(result.process)
         return TunnelResult(
             provider=provider,
-            error=f"public URL not reachable: {result.url}",
+            error=(
+                f"public URL not reachable within {PUBLIC_URL_GRACE:.0f}s: "
+                f"{result.url}"
+            ),
         )
     return result
+
+
+def wait_for_public_url(
+    url: str,
+    proc: Optional[subprocess.Popen],
+    total_wait: float = PUBLIC_URL_GRACE,
+    interval: float = PUBLIC_URL_RETRY_INTERVAL,
+) -> bool:
+    """Wait until the public URL answers, with a startup grace period.
+
+    A parsed URL is not proof the tunnel works: Cloudflare quick tunnels
+    print their URL before the edge is reachable. Retry every `interval`
+    seconds until the endpoint answers (401 counts as healthy — auth is
+    working) or `total_wait` expires. If the tunnel process exits while we
+    wait, fail immediately so the caller can report the exit code.
+    """
+    deadline = time.time() + total_wait
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False
+        if verify_url(url, timeout=5.0):
+            return True
+        time.sleep(interval)
+    return False
 
 
 def verify_url(url: str, timeout: float = 15.0) -> bool:
