@@ -11,6 +11,7 @@ printed to logs and never accepted in URL query parameters.
 """
 
 import os
+import re
 import secrets
 
 HOME: str = os.environ.get("HOME", "/data/data/com.termux/files/home")
@@ -20,6 +21,10 @@ HOME: str = os.environ.get("HOME", "/data/data/com.termux/files/home")
 # can coexist on one device without clobbering each other's PID / log /
 # public_url / token / OAuth state. Explicit TERMUX_MCP_* env vars still win.
 PROFILE: str = os.environ.get("TERMUX_MCP_PROFILE", "").strip()
+if PROFILE and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", PROFILE):
+    raise SystemExit(
+        "Invalid TERMUX_MCP_PROFILE: use 1-32 letters, digits, underscores, or hyphens"
+    )
 _PROFILE_SUFFIX = f"-{PROFILE}" if PROFILE else ""
 
 CONFIG_DIR: str = os.path.join(HOME, ".config", f"termux-mcp{_PROFILE_SUFFIX}")
@@ -53,6 +58,22 @@ def _env_or_file(name: str, default: str) -> str:
     return _FILE_VALUES.get(name, default)
 
 
+def _int_setting(name: str, default: str, minimum: int, maximum: int) -> int:
+    """Read a bounded integer setting and fail with an actionable message."""
+    raw = _env_or_file(name, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"Invalid {name}={raw!r}: expected an integer from {minimum} to {maximum}"
+        ) from None
+    if not minimum <= value <= maximum:
+        raise SystemExit(
+            f"Invalid {name}={raw!r}: expected a value from {minimum} to {maximum}"
+        )
+    return value
+
+
 def _write_config(updates: dict) -> None:
     """Persist config values to the config file (mode 0600)."""
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -82,18 +103,20 @@ def _write_config(updates: dict) -> None:
 # TERMUX_MCP_MCP_PORT (env or profile config file) still win.
 _DEFAULT_PORT = "18080" if PROFILE else "8080"
 _DEFAULT_MCP_PORT = "18765" if PROFILE else "8765"
-PORT: int = int(_env_or_file("TERMUX_MCP_PORT", _DEFAULT_PORT))
+PORT: int = _int_setting("TERMUX_MCP_PORT", _DEFAULT_PORT, 1, 65535)
 HOST: str = _env_or_file("TERMUX_MCP_HOST", "127.0.0.1")
 
 # Command timeout in seconds. 0 (default) = NO timeout — long operations
 # like pkg update/upgrade/install run until they finish. Set a positive
 # value (e.g. 600) to re-enable the watchdog kill.
-COMMAND_TIMEOUT: int = int(_env_or_file("TERMUX_MCP_TIMEOUT", "0"))
+COMMAND_TIMEOUT: int = _int_setting("TERMUX_MCP_TIMEOUT", "0", 0, 86400)
 
 # Cap on streamed command output sent to clients. Output beyond this is
 # drained (process keeps running) but discarded, with a truncation marker
 # appended. Keeps LLM tool results small and token-efficient.
-MAX_OUTPUT_BYTES: int = int(_env_or_file("TERMUX_MCP_MAX_OUTPUT", "20000"))
+MAX_OUTPUT_BYTES: int = _int_setting(
+    "TERMUX_MCP_MAX_OUTPUT", "20000", 1024, 10 * 1024 * 1024
+)
 
 AUTH_TOKEN: str = _env_or_file("TERMUX_MCP_AUTH_TOKEN", "")
 REQUIRE_AUTH: bool = bool(AUTH_TOKEN)
@@ -160,7 +183,9 @@ MCP_ENABLED: bool = _env_or_file("TERMUX_MCP_MCP_ENABLED", "1").lower() in (
     "1", "true", "yes", "on",
 )
 MCP_HOST: str = _env_or_file("TERMUX_MCP_MCP_HOST", HOST)
-MCP_PORT: int = int(_env_or_file("TERMUX_MCP_MCP_PORT", _DEFAULT_MCP_PORT))
+MCP_PORT: int = _int_setting("TERMUX_MCP_MCP_PORT", _DEFAULT_MCP_PORT, 1, 65535)
+if MCP_ENABLED and MCP_PORT == PORT:
+    raise SystemExit("Invalid configuration: REST and MCP ports must be different")
 
 # Optional workspace root for MCP filesystem tools. When set, MCP
 # read_file/write_file/list_files/make_directory are restricted to paths
@@ -175,7 +200,7 @@ TUNNEL_PROVIDERS: list = [
 ]
 # Seconds to wait for a tunnel provider to produce a public URL before
 # terminating it and trying the next one.
-TUNNEL_TIMEOUT: int = int(_env_or_file("TERMUX_MCP_TUNNEL_TIMEOUT", "45"))
+TUNNEL_TIMEOUT: int = _int_setting("TERMUX_MCP_TUNNEL_TIMEOUT", "45", 1, 600)
 
 AUTO_INPUT_INTERVAL: float = 0.5
 PORT_POLL_INTERVAL: float = 0.3

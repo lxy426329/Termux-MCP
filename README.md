@@ -224,6 +224,7 @@ termux-mcp restart
 | `termux-mcp status` | 查看运行状态 |
 | `termux-mcp logs` | 查看日志（`-n 100` 看更多） |
 | `termux-mcp doctor` | 自检（PASS/WARN/FAIL） |
+| `termux-mcp doctor --json` | 输出适合脚本与监控读取的结构化诊断结果 |
 | `termux-mcp token --show` | 显示 token |
 | `termux-mcp token --rotate` | 更换 token |
 

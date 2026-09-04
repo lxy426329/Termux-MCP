@@ -7,7 +7,7 @@ Commands:
   termux-mcp restart [--tunnel MODE]  Restart the server (tunnel kept by default).
   termux-mcp status                   Show server / tunnel / auth status.
   termux-mcp logs [-n N]              Show recent server logs.
-  termux-mcp doctor                   Run self-checks (PASS/WARN/FAIL).
+  termux-mcp doctor [--json]          Run human or machine-readable self-checks.
   termux-mcp token [--show] [--rotate]  Manage the auth token.
 
 `start` is the one-command experience: it ensures an auth token exists,
@@ -21,10 +21,13 @@ Pass --tunnel <mode> to rebuild the tunnel, or --no-tunnel to stop it.
 """
 
 import argparse
+import json
 import os
 import sys
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+from packaging.version import InvalidVersion, Version
 
 from . import __version__
 from . import process
@@ -83,7 +86,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_logs = sub.add_parser("logs", help="Show recent server logs")
     p_logs.add_argument("-n", type=int, default=50, help="Number of lines (default 50)")
 
-    sub.add_parser("doctor", help="Run self-checks")
+    p_doctor = sub.add_parser("doctor", help="Run self-checks")
+    p_doctor.add_argument(
+        "--json", action="store_true", dest="json_output",
+        help="Emit a machine-readable diagnostic report",
+    )
 
     p_token = sub.add_parser("token", help="Manage the auth token")
     p_token.add_argument("--show", action="store_true", help="Print the full token")
@@ -309,77 +316,126 @@ def _pkg_version(name: str) -> Optional[str]:
         return None
 
 
-def _check(checks: List[tuple], name: str, ok: bool, detail: str = "", warn: bool = False) -> None:
+def _check(
+    checks: List[Dict[str, str]],
+    check_id: str,
+    name: str,
+    ok: bool,
+    detail: str = "",
+    warn: bool = False,
+    emit: bool = True,
+) -> None:
     status = "WARN" if warn else ("PASS" if ok else "FAIL")
-    print(f"[{status}] {name}" + (f" — {detail}" if detail else ""))
-    checks.append((name, status))
+    if emit:
+        print(f"[{status}] {name}" + (f" — {detail}" if detail else ""))
+    checks.append({"id": check_id, "name": name, "status": status, "detail": detail})
 
 
-def cmd_doctor() -> int:
-    checks: List[tuple] = []
-    print(f"termux-mcp doctor (v{__version__})\n")
+def _version_in_range(
+    value: Optional[str], minimum: str, maximum_exclusive: str
+) -> bool:
+    if value is None:
+        return False
+    try:
+        parsed = Version(value)
+        return Version(minimum) <= parsed < Version(maximum_exclusive)
+    except InvalidVersion:
+        return False
+
+
+def cmd_doctor(json_output: bool = False) -> int:
+    checks: List[Dict[str, str]] = []
+    emit = not json_output
+    if emit:
+        print(f"termux-mcp doctor (v{__version__})\n")
 
     # OS / Termux
     is_termux = os.environ.get("PREFIX", "").startswith("/data/data/com.termux")
-    _check(checks, "Termux environment", is_termux,
-           "PREFIX detected" if is_termux else "not Termux (running on desktop?)", warn=not is_termux)
+    _check(checks, "termux_environment", "Termux environment", is_termux,
+           "PREFIX detected" if is_termux else "not Termux (running on desktop?)",
+           warn=not is_termux, emit=emit)
 
     # Python
     py = sys.version.split()[0]
-    _check(checks, "Python version", py >= "3.10", py)
+    _check(checks, "python_version", "Python version", sys.version_info >= (3, 10), py,
+           emit=emit)
 
     # Package / deps
     pkg = _pkg_version("termux-mcp")
-    _check(checks, "termux-mcp installed", pkg is not None,
-           pkg or "not installed via pip (running from source is fine)", warn=pkg is None)
+    _check(checks, "package_installed", "termux-mcp installed", pkg is not None,
+           pkg or "not installed via pip (running from source is fine)", warn=pkg is None,
+           emit=emit)
     mcp_ver = _pkg_version("mcp")
-    _check(checks, "MCP SDK (mcp>=1.28,<2)", mcp_ver is not None and mcp_ver < "2",
-           mcp_ver or "not installed")
+    _check(checks, "mcp_sdk_version", "MCP SDK (mcp>=1.28,<2)",
+           _version_in_range(mcp_ver, "1.28", "2"), mcp_ver or "not installed",
+           emit=emit)
     uvi = _pkg_version("uvicorn")
-    _check(checks, "uvicorn", uvi is not None, uvi or "not installed")
+    _check(checks, "uvicorn", "uvicorn", uvi is not None, uvi or "not installed",
+           emit=emit)
 
     # Auth
-    _check(checks, "Auth token configured", token_configured(),
-           "enabled" if token_configured() else "DISABLED — run 'termux-mcp start'")
+    auth_ok = token_configured()
+    _check(checks, "auth_token", "Auth token configured", auth_ok,
+           "enabled" if auth_ok else "not configured — start will generate one",
+           warn=not auth_ok, emit=emit)
 
     # OAuth / discovery (no secrets printed; absence is not a FAIL when
     # static Bearer mode is intentionally used).
     from . import oauth
     if oauth.oauth_enabled():
         issuer = oauth.get_issuer()
-        _check(checks, "OAuth resource metadata", True, "enabled")
-        _check(checks, "OAuth issuer", bool(issuer),
-               issuer or "auto — no public URL yet", warn=not issuer)
+        _check(checks, "oauth_metadata", "OAuth resource metadata", True, "enabled",
+               emit=emit)
+        _check(checks, "oauth_issuer", "OAuth issuer", bool(issuer),
+               issuer or "auto — no public URL yet", warn=not issuer, emit=emit)
         pub = get_public_url()
-        _check(checks, "Public MCP URL", bool(pub),
-               f"{pub}/mcp" if pub else "unavailable", warn=not pub)
+        _check(checks, "public_url", "Public MCP URL", bool(pub),
+               f"{pub}/mcp" if pub else "unavailable", warn=not pub, emit=emit)
     else:
-        _check(checks, "OAuth resource metadata", True, "disabled (static Bearer mode)")
+        _check(checks, "oauth_metadata", "OAuth resource metadata", True,
+               "disabled (static Bearer mode)", emit=emit)
 
     # Workspace
     if WORKSPACE_ROOT:
-        _check(checks, "Workspace root", os.path.isdir(WORKSPACE_ROOT), WORKSPACE_ROOT)
+        _check(checks, "workspace_root", "Workspace root",
+               os.path.isdir(WORKSPACE_ROOT), WORKSPACE_ROOT, emit=emit)
     else:
-        _check(checks, "Workspace root", True, "not set (MCP filesystem tools unrestricted)", warn=True)
+        _check(checks, "workspace_root", "Workspace root", True,
+               "not set (MCP filesystem tools unrestricted)", warn=True, emit=emit)
 
-    # Ports
-    _check(checks, f"REST port {PORT}", process.port_open(PORT),
-           "listening" if process.port_open(PORT) else "not listening")
-    if MCP_ENABLED:
-        _check(checks, f"MCP port {MCP_PORT}", process.port_open(MCP_PORT),
-               "listening" if process.port_open(MCP_PORT) else "not listening")
-
-    # Process
+    # Closed ports are expected before first start. An occupied port while our
+    # process is stopped is the actionable failure.
     running = process.is_running()
-    _check(checks, "Server process", running,
-           f"pid {process.read_pid()}" if running else "not running", warn=not running)
+    rest_open = process.port_open(PORT)
+    if running:
+        _check(checks, "rest_port", f"REST port {PORT}", rest_open,
+               "listening" if rest_open else "server running but port not listening",
+               emit=emit)
+    else:
+        _check(checks, "rest_port", f"REST port {PORT}", not rest_open,
+               "occupied by another process" if rest_open else "not listening; server stopped",
+               warn=not rest_open, emit=emit)
+    if MCP_ENABLED:
+        mcp_open = process.port_open(MCP_PORT)
+        if running:
+            _check(checks, "mcp_port", f"MCP port {MCP_PORT}", mcp_open,
+                   "listening" if mcp_open else "server running but port not listening",
+                   emit=emit)
+        else:
+            _check(checks, "mcp_port", f"MCP port {MCP_PORT}", not mcp_open,
+                   "occupied by another process" if mcp_open else "not listening; server stopped",
+                   warn=not mcp_open, emit=emit)
+
+    _check(checks, "server_process", "Server process", running,
+           f"pid {process.read_pid()}" if running else "not running", warn=not running,
+           emit=emit)
 
     # Tunnel deps
     for name in ("ssh", "cloudflared"):
         import shutil
         found = shutil.which(name) is not None
-        _check(checks, f"tunnel dep: {name}", found,
-               shutil.which(name) or "not installed", warn=not found)
+        _check(checks, f"tunnel_{name}", f"tunnel dep: {name}", found,
+               shutil.which(name) or "not installed", warn=not found, emit=emit)
 
     # Localhost MCP health (authenticated probe)
     if MCP_ENABLED and process.port_open(MCP_PORT):
@@ -393,23 +449,36 @@ def cmd_doctor() -> int:
             )
             try:
                 urllib.request.urlopen(req, timeout=5)
-                _check(checks, "MCP health", True, "responded")
+                _check(checks, "mcp_health", "MCP health", True, "responded",
+                       emit=emit)
             except urllib.error.HTTPError as e:
-                _check(checks, "MCP health", e.code == 401,
-                       f"HTTP {e.code}" + (" (auth working)" if e.code == 401 else ""))
+                _check(checks, "mcp_health", "MCP health", e.code == 401,
+                       f"HTTP {e.code}" + (" (auth working)" if e.code == 401 else ""),
+                       emit=emit)
         except Exception as e:
-            _check(checks, "MCP health", False, str(e))
+            _check(checks, "mcp_health", "MCP health", False, str(e), emit=emit)
     else:
-        _check(checks, "MCP health", False, "MCP port not listening", warn=True)
+        _check(checks, "mcp_health", "MCP health", False,
+               "MCP port not listening", warn=True, emit=emit)
+
+    fails = [c for c in checks if c["status"] == "FAIL"]
+    warns = [c for c in checks if c["status"] == "WARN"]
+    summary: Dict[str, Any] = {
+        "pass": len(checks) - len(fails) - len(warns),
+        "warn": len(warns),
+        "fail": len(fails),
+    }
+    if json_output:
+        print(json.dumps({"version": __version__, "summary": summary, "checks": checks},
+                         ensure_ascii=False, indent=2))
+        return 1 if fails else 0
 
     print()
-    fails = [c for c in checks if c[1] == "FAIL"]
-    warns = [c for c in checks if c[1] == "WARN"]
     if fails:
-        print(f"{len(fails)} FAIL, {len(warns)} WARN, {len(checks) - len(fails) - len(warns)} PASS")
+        print(f"{summary['fail']} FAIL, {summary['warn']} WARN, {summary['pass']} PASS")
         print("Fix the FAIL items above, then re-run 'termux-mcp doctor'.")
         return 1
-    print(f"{len(checks) - len(warns)} PASS, {len(warns)} WARN, 0 FAIL")
+    print(f"{summary['pass']} PASS, {summary['warn']} WARN, 0 FAIL")
     if warns:
         print("WARN items are optional — see details above.")
     return 0
@@ -437,7 +506,7 @@ def run(argv: Optional[List[str]] = None) -> int:
     if args.command == "logs":
         return cmd_logs(args)
     if args.command == "doctor":
-        return cmd_doctor()
+        return cmd_doctor(args.json_output)
     if args.command == "token":
         return cmd_token(args)
     return 0

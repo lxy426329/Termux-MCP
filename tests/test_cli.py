@@ -2,6 +2,7 @@
 stop/status, Python version detection, and dependency compatibility.
 """
 
+import json
 import os
 import sys
 
@@ -24,8 +25,22 @@ def isolated_state(tmp_path, monkeypatch):
 # ── Python version detection ─────────────────────────────────────────────────
 
 def test_python_version_detection():
-    py = sys.version.split()[0]
-    assert py >= "3.10"
+    assert sys.version_info >= (3, 10)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("1.27.9", False),
+        ("1.28.0", True),
+        ("1.99.0", True),
+        ("2.0.0", False),
+        ("not-a-version", False),
+        (None, False),
+    ],
+)
+def test_version_range(value, expected):
+    assert cli._version_in_range(value, "1.28", "2") is expected
 
 
 def test_pkg_version_found():
@@ -152,11 +167,31 @@ def test_parse_args_token_rotate():
     assert args.rotate is True
 
 
+def test_parse_args_doctor_json():
+    args = cli._parse_args(["doctor", "--json"])
+    assert args.command == "doctor"
+    assert args.json_output is True
+
+
 def test_doctor_runs_without_crashing(capsys):
     rc = cli.cmd_doctor()
     out = capsys.readouterr().out
     assert "PASS" in out or "WARN" in out or "FAIL" in out
     assert rc in (0, 1)
+
+
+def test_doctor_json_is_machine_readable(capsys):
+    rc = cli.cmd_doctor(json_output=True)
+    report = json.loads(capsys.readouterr().out)
+    assert rc in (0, 1)
+    assert report["version"]
+    assert set(report["summary"]) == {"pass", "warn", "fail"}
+    assert report["checks"]
+    assert all(
+        set(check) == {"id", "name", "status", "detail"}
+        for check in report["checks"]
+    )
+    assert len({check["id"] for check in report["checks"]}) == len(report["checks"])
 
 
 # ── restart semantics (server/tunnel lifecycle decoupling) ───────────────────
@@ -338,3 +373,43 @@ def test_profile_isolation_explicit_env_still_wins():
     dev = _profile_probe("dev", extra_env={"TERMUX_MCP_PORT": "9999"})
     assert dev["port"] == 9999
     assert dev["mcp_port"] == 18765  # profile default for the MCP port
+
+
+@pytest.mark.parametrize("profile", ["../escape", "bad/name", "a" * 33, "bad profile"])
+def test_invalid_profile_is_rejected(profile):
+    import subprocess
+
+    env = os.environ.copy()
+    env["TERMUX_MCP_PROFILE"] = profile
+    result = subprocess.run(
+        [sys.executable, "-c", "import termux_mcp.config"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode != 0
+    assert "Invalid TERMUX_MCP_PROFILE" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("TERMUX_MCP_PORT", "0"),
+        ("TERMUX_MCP_MCP_PORT", "70000"),
+        ("TERMUX_MCP_TIMEOUT", "forever"),
+        ("TERMUX_MCP_MAX_OUTPUT", "12"),
+    ],
+)
+def test_invalid_numeric_config_is_rejected(name, value):
+    import subprocess
+
+    env = os.environ.copy()
+    env[name] = value
+    result = subprocess.run(
+        [sys.executable, "-c", "import termux_mcp.config"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode != 0
+    assert f"Invalid {name}" in result.stderr

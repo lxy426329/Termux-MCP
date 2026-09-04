@@ -18,7 +18,10 @@ reliably operate it.” Checked items describe the current `main` baseline.
 
 ## 0.10 — installation and repair
 
-- [ ] add `termux-mcp doctor --json` with stable check identifiers
+- [x] add `termux-mcp doctor --json` with stable check identifiers
+- [x] validate profiles, ports, timeouts, and output limits before startup
+- [x] preserve installer output in an actionable local log
+- [x] run tests and critical static checks in GitHub Actions
 - [ ] add targeted repair suggestions for package, PATH, port, tunnel, and permission failures
 - [ ] add `termux-mcp update` with clean-tree checks and post-update rollback
 - [ ] add an uninstall command that preserves user configuration by default
@@ -41,4 +44,3 @@ reliably operate it.” Checked items describe the current `main` baseline.
 - [ ] threat-model and exposed-tool review
 - [ ] compatibility matrix for major MCP clients
 - [ ] recovery guide covering token rotation, tunnel failure, and corrupted state
-

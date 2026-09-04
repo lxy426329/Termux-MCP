@@ -15,11 +15,15 @@
 set -euo pipefail
 
 STEP="初始化"
+INSTALL_LOG=""
 fail() {
   echo ""
   echo "=================================================="
   echo " 安装失败于步骤: $STEP"
   echo " 错误信息: $1"
+  if [ -n "$INSTALL_LOG" ]; then
+    echo " 安装日志: $INSTALL_LOG"
+  fi
   echo "=================================================="
   echo ""
   echo "请把上面的错误信息发给维护者，或查看 README 的 Troubleshooting 章节。"
@@ -29,6 +33,19 @@ fail() {
 log() { echo "==> $1"; }
 ok()  { echo "    OK: $1"; }
 
+run_logged() {
+  if "$@" >>"$INSTALL_LOG" 2>&1; then
+    return 0
+  else
+    local exit_code=$?
+  fi
+  echo ""
+  echo "---- 最近 40 行安装日志 ----" >&2
+  tail -n 40 "$INSTALL_LOG" >&2 || true
+  echo "----------------------------" >&2
+  return "$exit_code"
+}
+
 # ── 1. 检查 Termux 环境 ─────────────────────────────────────────────────────
 STEP="检查 Termux 环境"
 if [ -z "${PREFIX:-}" ] || [[ "$PREFIX" != /data/data/com.termux* ]]; then
@@ -36,16 +53,22 @@ if [ -z "${PREFIX:-}" ] || [[ "$PREFIX" != /data/data/com.termux* ]]; then
 fi
 ok "Termux 环境 ($PREFIX)"
 
+INSTALL_LOG="${TERMUX_MCP_INSTALL_LOG:-$HOME/.local/state/termux-mcp/install.log}"
+mkdir -p "$(dirname "$INSTALL_LOG")"
+: >"$INSTALL_LOG"
+chmod 600 "$INSTALL_LOG"
+ok "安装日志 ($INSTALL_LOG)"
+
 # ── 2. 更新软件包列表 ───────────────────────────────────────────────────────
 STEP="更新软件包列表 (pkg update)"
 log "更新软件包列表..."
-pkg update -y >/dev/null 2>&1 || fail "pkg update 失败，请检查网络后重试"
+run_logged pkg update -y || fail "pkg update 失败，请检查网络或软件源后重试"
 ok "pkg update"
 
 # ── 3. 安装系统依赖 ─────────────────────────────────────────────────────────
 STEP="安装系统依赖"
 log "安装 python / git / openssh ..."
-pkg install -y python git openssh >/dev/null 2>&1 || fail "pkg install 失败"
+run_logged pkg install -y python git openssh || fail "pkg install 失败"
 ok "python git openssh"
 
 # ── 4. 检查 Python / pip ────────────────────────────────────────────────────
@@ -56,17 +79,31 @@ ok "$PY_VER"
 command -v pip >/dev/null 2>&1 || fail "pip 未安装"
 ok "pip"
 
-# ── 5. 安装项目（含 mcp SDK + uvicorn，由 pyproject.toml 声明）──────────────
+# ── 5. 定位并安装项目（含 mcp SDK + uvicorn）──────────────────────────────
 STEP="安装项目"
-if [ -f pyproject.toml ]; then
+is_project_checkout() {
+  [ -f pyproject.toml ] && [ -d termux_mcp ] &&
+    grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*"termux-mcp"' pyproject.toml
+}
+
+if is_project_checkout; then
   log "在当前目录安装项目..."
-  pip install . >/dev/null 2>&1 || fail "pip install . 失败"
+  run_logged pip install . || fail "pip install . 失败"
   ok "pip install ."
 else
-  log "未找到项目文件，从 GitHub 克隆..."
-  git clone --depth 1 https://github.com/lxy426329/Termux-MCP.git termux-mcp || fail "git clone 失败"
-  cd termux-mcp
-  pip install . >/dev/null 2>&1 || fail "pip install . 失败"
+  SOURCE_DIR="${TERMUX_MCP_SOURCE_DIR:-$HOME/Termux-MCP}"
+  if [ -d "$SOURCE_DIR/.git" ]; then
+    log "使用已有源码目录 $SOURCE_DIR"
+    cd "$SOURCE_DIR"
+    is_project_checkout || fail "$SOURCE_DIR 不是有效的 Termux-MCP 仓库"
+  elif [ -e "$SOURCE_DIR" ]; then
+    fail "$SOURCE_DIR 已存在但不是 Git 仓库，请移走该目录后重试"
+  else
+    log "未找到项目文件，从 GitHub 克隆到 $SOURCE_DIR ..."
+    run_logged git clone --depth 1 https://github.com/lxy426329/Termux-MCP.git "$SOURCE_DIR" || fail "git clone 失败"
+    cd "$SOURCE_DIR"
+  fi
+  run_logged pip install . || fail "pip install . 失败"
   ok "pip install ."
 fi
 

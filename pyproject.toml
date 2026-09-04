@@ -17,12 +17,14 @@ authors = [{name = "Parixit Sutariya"}]
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.28,<2",
+    "packaging>=23",
     "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7",
+    "ruff>=0.8",
 ]
 
 [project.scripts]

@@ -66,6 +66,25 @@ def _pid_alive(pid: Optional[int]) -> bool:
             return False
         ctypes.windll.kernel32.CloseHandle(handle)
         return True
+    # Reap the process when the caller is also its parent (notably tests and
+    # embedded launchers). A normal later CLI invocation is not the parent and
+    # receives ChildProcessError, then falls through to the portable probes.
+    try:
+        waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+        if waited_pid == pid:
+            return False
+    except ChildProcessError:
+        pass
+    # kill(pid, 0) succeeds for a terminated child that is waiting to be
+    # reaped. Treat that zombie as stopped instead of reporting a phantom
+    # live server in status/restart and long-running test parents.
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as stat_file:
+            fields = stat_file.read().split()
+        if len(fields) >= 3 and fields[2] == "Z":
+            return False
+    except OSError:
+        pass
     try:
         os.kill(pid, 0)
         return True
