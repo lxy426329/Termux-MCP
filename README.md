@@ -2,6 +2,22 @@
 
 > **Fork notice**: This repository is a fork of [termuxgpt/termux-mcp](https://github.com/termuxgpt/termux-mcp) (upstream, AGPL-3.0). All original code, copyright, and attribution belong to the upstream authors. This fork keeps the original REST API intact and adds a standards-compliant MCP layer on top of it.
 
+## 快速安装（从空 Termux 开始）
+
+已经安装好 Termux 后，可用一条命令完成环境检测、源码下载或安全更新、依赖安装与最终自检：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lxy426329/Termux-MCP/main/scripts/bootstrap.sh | bash
+```
+
+安装结束后直接启动：
+
+```bash
+termux-mcp start
+```
+
+如果希望逐步检查每条命令，继续阅读下面的零基础教程。
+
 ## Changes in this fork
 
 This fork adds a minimal, standards-compliant **MCP (Model Context Protocol)** layer without removing the existing REST API:
