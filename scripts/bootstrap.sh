@@ -113,9 +113,4 @@ else
   fail "installation finished but the termux-mcp command is not on PATH"
 fi
 
-cat <<'EOF'
-
-Next command:
-  termux-mcp start
-EOF
-
+printf '\nTermux-MCP 已经准备好啦 ( Ꙭ)\n'

@@ -9,6 +9,8 @@ Commands:
   termux-mcp logs [-n N]              Show recent server logs.
   termux-mcp doctor [--json]          Run human or machine-readable self-checks.
   termux-mcp token [--show] [--rotate]  Manage the auth token.
+  termux-mcp setup                    Run the friendly first-time connection flow.
+  termux-mcp permissions              Show or change the AI permission mode.
 
 `start` is the one-command experience: it ensures an auth token exists,
 starts the server, waits for REST + MCP health, starts the selected tunnel,
@@ -95,6 +97,21 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_token = sub.add_parser("token", help="Manage the auth token")
     p_token.add_argument("--show", action="store_true", help="Print the full token")
     p_token.add_argument("--rotate", action="store_true", help="Generate a new token")
+
+    p_setup = sub.add_parser("setup", help="First-time guided setup")
+    p_setup.add_argument("--client", choices=["chatgpt", "claude", "grok"])
+    p_setup.add_argument(
+        "--permissions", choices=["read-only", "standard", "full"]
+    )
+    p_setup.add_argument("--tunnel", default="auto", choices=TUNNEL_CHOICES)
+    p_setup.add_argument("--no-tunnel", action="store_true")
+    p_setup.add_argument("--non-interactive", action="store_true")
+    p_setup.add_argument("--force", action="store_true")
+
+    p_permissions = sub.add_parser("permissions", help="Show or change permissions")
+    permissions_sub = p_permissions.add_subparsers(dest="permissions_action")
+    p_permissions_set = permissions_sub.add_parser("set", help="Set permission mode")
+    p_permissions_set.add_argument("mode", choices=["read-only", "standard", "full"])
 
     return parser.parse_args(argv)
 
@@ -256,6 +273,9 @@ def cmd_status() -> int:
     if MCP_ENABLED:
         print(f"MCP  http://127.0.0.1:{MCP_PORT}/mcp: {'OK' if process.port_open(MCP_PORT) else 'DOWN'}")
     print(f"Auth: {'enabled' if token_configured() else 'DISABLED'}")
+    from . import config
+    print(f"Client: {config.CLIENT_TARGET}")
+    print(f"Permissions: {config.PERMISSION_MODE}")
     if WORKSPACE_ROOT:
         print(f"Workspace: {WORKSPACE_ROOT}")
     if process.tunnel_is_running():
@@ -303,6 +323,28 @@ def cmd_token(args: argparse.Namespace) -> int:
     else:
         print("Auth token: NOT configured")
         print("Run 'termux-mcp start' to auto-generate one, or 'termux-mcp token --rotate'.")
+    return 0
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    from .onboarding import run_setup
+    return run_setup(args, cmd_start)
+
+
+def cmd_permissions(args: argparse.Namespace) -> int:
+    from . import config
+    from .permissions import MODES, status
+
+    if args.permissions_action == "set":
+        config.set_permission_mode(args.mode)
+        print(f"✓ 权限模式已设为 {args.mode}: {MODES[args.mode]}")
+        if process.is_running():
+            print("重启后生效：termux-mcp restart")
+        return 0
+    current = status()
+    print(f"当前权限：{current['mode']}")
+    print(current["description"])
+    print("修改：termux-mcp permissions set <read-only|standard|full>")
     return 0
 
 
@@ -509,6 +551,10 @@ def run(argv: Optional[List[str]] = None) -> int:
         return cmd_doctor(args.json_output)
     if args.command == "token":
         return cmd_token(args)
+    if args.command == "setup":
+        return cmd_setup(args)
+    if args.command == "permissions":
+        return cmd_permissions(args)
     return 0
 
 

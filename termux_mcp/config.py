@@ -192,6 +192,21 @@ if MCP_ENABLED and MCP_PORT == PORT:
 # inside this root (resolved with realpath). REST is unaffected.
 WORKSPACE_ROOT: str = _env_or_file("TERMUX_MCP_WORKSPACE", "").strip()
 
+# User-selected capability level. This is intentionally independent from the
+# process profile above: profiles isolate instances, while permission modes
+# decide what an attached AI may do through an instance.
+PERMISSION_MODE: str = _env_or_file("TERMUX_MCP_PERMISSIONS", "standard").strip().lower()
+if PERMISSION_MODE not in ("read-only", "standard", "full"):
+    raise SystemExit(
+        "Invalid TERMUX_MCP_PERMISSIONS: use read-only, standard, or full"
+    )
+CLIENT_TARGET: str = _env_or_file("TERMUX_MCP_CLIENT", "chatgpt").strip().lower()
+if CLIENT_TARGET not in ("chatgpt", "claude", "grok"):
+    raise SystemExit("Invalid TERMUX_MCP_CLIENT: use chatgpt, claude, or grok")
+SETUP_COMPLETE: bool = _env_or_file("TERMUX_MCP_SETUP_COMPLETE", "0").lower() in (
+    "1", "true", "yes", "on",
+)
+
 # Tunnel provider order for `termux-mcp start --tunnel auto`.
 TUNNEL_PROVIDERS: list = [
     p.strip()
@@ -243,3 +258,36 @@ def rotate_token() -> str:
 def token_configured() -> bool:
     """True when an auth token is configured (env or config file)."""
     return bool(AUTH_TOKEN)
+
+
+def save_user_preferences(client: str, permissions: str) -> None:
+    """Persist onboarding choices and update this process immediately."""
+    client = client.strip().lower()
+    permissions = permissions.strip().lower()
+    if client not in ("chatgpt", "claude", "grok"):
+        raise ValueError("client must be chatgpt, claude, or grok")
+    if permissions not in ("read-only", "standard", "full"):
+        raise ValueError("permissions must be read-only, standard, or full")
+    _write_config({
+        "TERMUX_MCP_CLIENT": client,
+        "TERMUX_MCP_PERMISSIONS": permissions,
+        "TERMUX_MCP_SETUP_COMPLETE": "1",
+        # Auto mode lets the public tunnel become the OAuth issuer, so the
+        # user can paste one URL instead of copying a Bearer token separately.
+        "TERMUX_MCP_OAUTH_ISSUER": "auto",
+    })
+    global CLIENT_TARGET, PERMISSION_MODE, SETUP_COMPLETE, OAUTH_ISSUER
+    CLIENT_TARGET = client
+    PERMISSION_MODE = permissions
+    SETUP_COMPLETE = True
+    OAUTH_ISSUER = "auto"
+
+
+def set_permission_mode(mode: str) -> None:
+    """Persist a permission mode selected by the device owner."""
+    mode = mode.strip().lower()
+    if mode not in ("read-only", "standard", "full"):
+        raise ValueError("permissions must be read-only, standard, or full")
+    _write_config({"TERMUX_MCP_PERMISSIONS": mode})
+    global PERMISSION_MODE
+    PERMISSION_MODE = mode

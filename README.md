@@ -10,11 +10,8 @@
 curl -fsSL https://raw.githubusercontent.com/lxy426329/Termux-MCP/main/scripts/bootstrap.sh | bash
 ```
 
-安装结束后直接启动：
-
-```bash
-termux-mcp start
-```
+第一次安装会自动进入萌系引导：选择 ChatGPT / Claude / Grok、选择权限，
+然后启动服务并把唯一需要复制的 MCP URL 交给你。以后直接在 AI 对话框里操作即可。
 
 如果希望逐步检查每条命令，继续阅读下面的零基础教程。
 
@@ -23,8 +20,16 @@ termux-mcp start
 This fork adds a minimal, standards-compliant **MCP (Model Context Protocol)** layer without removing the existing REST API:
 
 - **MCP Streamable HTTP endpoint** at `/mcp` (port `8765` by default), built on the official `mcp` Python SDK (`mcp>=1.28,<2`) + `uvicorn`.
-- **8 curated MCP tools** (the remaining device-control tools are intentionally not exposed yet):
-  `run_command`, `read_file`, `write_file`, `list_files`, `make_directory`, `get_location`, `get_battery`, `send_notification`.
+- **14 MCP tools**: 8 built-in device/file tools plus permission visibility and
+  managed-MCP control (`mcp_install`, `mcp_list`, `mcp_inspect`, `mcp_call`, `mcp_remove`).
+- **One-time friendly onboarding**: `termux-mcp setup` asks only for the target AI
+  and permission level, starts the gateway, then prints one copy-ready URL.
+- **Owner-selected permissions**: `read-only`, `standard`, or `full`; full mode is
+  an explicit choice that lets the attached AI use Termux without repeated risk prompts.
+- **MCP compatibility layer**: import an existing remote MCP URL, or clone and
+  prepare common Python/Node.js MCP repositories from GitHub. Unusual projects can
+  supply their documented stdio launch command. Remote imports try Streamable HTTP
+  first and automatically fall back to legacy SSE during connection setup.
 - **Bearer authentication** on the MCP endpoint via `Authorization: Bearer` header only — tokens in URL query parameters are **not** supported. All REST informational endpoints except `/ping` now require auth as well.
 - **Shared operations layer** (`termux_mcp/operations.py`): REST and MCP call the same Python functions directly — the MCP layer does **not** proxy through the REST API over localhost.
 - **Workspace / symlink protection**: optional `TERMUX_MCP_WORKSPACE` root restriction for the MCP filesystem tools; paths are resolved with `realpath` before boundary checks, so symlink escapes are rejected.
@@ -225,6 +230,9 @@ termux-mcp restart
 | `termux-mcp logs` | 查看日志（`-n 100` 看更多） |
 | `termux-mcp doctor` | 自检（PASS/WARN/FAIL） |
 | `termux-mcp doctor --json` | 输出适合脚本与监控读取的结构化诊断结果 |
+| `termux-mcp setup` | 重新运行首次连接向导 |
+| `termux-mcp permissions` | 查看当前 AI 权限 |
+| `termux-mcp permissions set full` | 将权限切换为完全控制（重启生效） |
 | `termux-mcp token --show` | 显示 token |
 | `termux-mcp token --rotate` | 更换 token |
 
@@ -240,6 +248,8 @@ termux-mcp restart
 | `TERMUX_MCP_MCP_PORT` | `8765` | MCP 端口 |
 | `TERMUX_MCP_MCP_HOST` | `127.0.0.1` | MCP 绑定地址 |
 | `TERMUX_MCP_WORKSPACE` | 空 | MCP 文件工具的工作区根目录（realpath 边界检查） |
+| `TERMUX_MCP_CLIENT` | `chatgpt` | 首选客户端：`chatgpt` / `claude` / `grok` |
+| `TERMUX_MCP_PERMISSIONS` | `standard` | 权限：`read-only` / `standard` / `full` |
 | `TERMUX_MCP_TIMEOUT` | `0` | 命令超时秒数（0=不超时） |
 | `TERMUX_MCP_MAX_OUTPUT` | `20000` | 输出上限字节 |
 | `TERMUX_MCP_TUNNEL_PROVIDERS` | `pinggy,cloudflare,localhost-run` | auto 模式的隧道顺序 |

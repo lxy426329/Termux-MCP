@@ -18,6 +18,10 @@ reliably operate it.” Checked items describe the current `main` baseline.
 
 ## 0.10 — installation and repair
 
+- [x] add a one-time guided setup for ChatGPT, Claude, and Grok
+- [x] add owner-selectable read-only, standard, and full permission modes
+- [x] import remote MCP URLs and common Python/Node.js GitHub MCP projects
+- [x] expose AI-facing managed-MCP install/list/inspect/call/remove tools
 - [x] add `termux-mcp doctor --json` with stable check identifiers
 - [x] validate profiles, ports, timeouts, and output limits before startup
 - [x] preserve installer output in an actionable local log

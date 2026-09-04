@@ -1,14 +1,13 @@
 """Minimal standards-compliant MCP layer for termux-mcp.
 
-Exposes a curated set of 8 MCP tools over Streamable HTTP using the
+Exposes built-in device tools and managed-MCP control tools over Streamable HTTP using the
 official `mcp` Python SDK. The tools call the same shared operations as
 the REST API (termux_mcp.operations) directly — they never proxy through
 the REST HTTP API.
 
 Security:
   * Authorization: Bearer only (no tokens in URL query parameters).
-  * Dangerous commands stay blocked; warning commands return a structured
-    confirmation-required result.
+  * Command behavior follows the permission level chosen by the device owner.
   * Optional workspace root restriction for filesystem tools, enforced
     with realpath resolution.
 """
@@ -19,7 +18,9 @@ import time
 from urllib.parse import urlparse
 
 from . import config
+from . import managed_mcp
 from . import operations
+from . import permissions
 from .auth import get_auth_provider
 from .config import MCP_HOST, MCP_PORT, WORKSPACE_ROOT
 
@@ -102,7 +103,16 @@ def tool_run_command(cmd: str, confirmed: bool = False) -> dict:
     (e.g. rm -rf) require `confirmed=True` and otherwise return a
     structured confirmation-required response.
     """
-    assessment = operations.assess_command(cmd, confirmed)
+    if not permissions.allows("command.run"):
+        return permissions.denied("command.run")
+    # Full mode is an explicit device-owner decision. It intentionally skips
+    # repeated confirmation prompts while retaining snapshots/output limits.
+    assessment = operations.assess_command(
+        cmd, confirmed or permissions.current_mode() == "full"
+    )
+    if permissions.current_mode() == "full":
+        assessment["blocked"] = False
+        assessment["confirmation_required"] = False
     if assessment["blocked"]:
         return {
             "blocked": True,
@@ -127,6 +137,7 @@ def tool_run_command(cmd: str, confirmed: bool = False) -> dict:
             "snapshots": [],
         }
     result = operations.execute_command(cmd)
+    result.risk_level = assessment["risk_level"]
     return {
         "stdout": result.stdout,
         "stderr": result.stderr,
@@ -146,6 +157,8 @@ def tool_read_file(path: str, offset: int = 0, limit: int = 500) -> dict:
 
 def tool_write_file(path: str, content: str) -> dict:
     """Write text content to a file. The previous version is snapshotted."""
+    if not permissions.allows("filesystem.write"):
+        return permissions.denied("filesystem.write")
     return operations.write_file(path, content, workspace=WORKSPACE_ROOT)
 
 
@@ -156,6 +169,8 @@ def tool_list_files(path: str = ".") -> dict:
 
 def tool_make_directory(path: str) -> dict:
     """Create a directory (and any missing parents)."""
+    if not permissions.allows("filesystem.write"):
+        return permissions.denied("filesystem.write")
     return operations.make_directory(path, workspace=WORKSPACE_ROOT)
 
 
@@ -175,7 +190,72 @@ def tool_send_notification(
     priority: str = "default",
 ) -> dict:
     """Send a device notification."""
+    if not permissions.allows("device.write"):
+        return permissions.denied("device.write")
     return operations.send_notification(title, content, priority)
+
+
+def tool_permissions_status() -> dict:
+    """Show the permission level chosen locally by the device owner."""
+    return permissions.status()
+
+
+def tool_mcp_install(
+    source: str,
+    name: str = "",
+    command: str = "",
+    authorization: str = "",
+) -> dict:
+    """Install a remote MCP URL or GitHub MCP repository.
+
+    For unusual GitHub projects, pass the repository's documented stdio
+    launch command. The server is then available through mcp_inspect and
+    mcp_call without asking the user to return to Termux.
+    """
+    if not permissions.allows("managed.install"):
+        return permissions.denied("managed.install")
+    try:
+        entry = managed_mcp.install(source, name, command, authorization)
+        return {
+            "installed": True,
+            "server": entry,
+            "next": f"Call mcp_inspect with name={entry['name']!r}",
+        }
+    except managed_mcp.ManagedMCPError as exc:
+        return {"installed": False, "error": str(exc)}
+
+
+def tool_mcp_list() -> dict:
+    """List MCP servers managed by this Termux gateway."""
+    return managed_mcp.list_servers()
+
+
+async def tool_mcp_inspect(name: str) -> dict:
+    """Connect to a managed MCP server and list its available tools."""
+    try:
+        return await managed_mcp.inspect(name)
+    except Exception as exc:
+        return {"error": str(exc), "server": name}
+
+
+async def tool_mcp_call(name: str, tool: str, arguments: dict = None) -> dict:
+    """Call a tool exposed by an installed or imported MCP server."""
+    if not permissions.allows("managed.call"):
+        return permissions.denied("managed.call")
+    try:
+        return await managed_mcp.call(name, tool, arguments)
+    except Exception as exc:
+        return {"error": str(exc), "server": name, "tool": tool}
+
+
+def tool_mcp_remove(name: str) -> dict:
+    """Remove a managed MCP registration and archive its local files."""
+    if not permissions.allows("managed.remove"):
+        return permissions.denied("managed.remove")
+    try:
+        return managed_mcp.remove(name)
+    except managed_mcp.ManagedMCPError as exc:
+        return {"error": str(exc), "server": name}
 
 
 # ── App construction ─────────────────────────────────────────────────────────
@@ -226,6 +306,12 @@ def _build_mcp_app():
     mcp.tool(name="get_location")(tool_get_location)
     mcp.tool(name="get_battery")(tool_get_battery)
     mcp.tool(name="send_notification")(tool_send_notification)
+    mcp.tool(name="permissions_status")(tool_permissions_status)
+    mcp.tool(name="mcp_install")(tool_mcp_install)
+    mcp.tool(name="mcp_list")(tool_mcp_list)
+    mcp.tool(name="mcp_inspect")(tool_mcp_inspect)
+    mcp.tool(name="mcp_call")(tool_mcp_call)
+    mcp.tool(name="mcp_remove")(tool_mcp_remove)
 
     app = mcp.streamable_http_app()
 

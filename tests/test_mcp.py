@@ -26,6 +26,12 @@ EXPECTED_TOOLS = [
     "get_location",
     "get_battery",
     "send_notification",
+    "permissions_status",
+    "mcp_install",
+    "mcp_list",
+    "mcp_inspect",
+    "mcp_call",
+    "mcp_remove",
 ]
 
 

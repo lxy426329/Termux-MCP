@@ -173,6 +173,18 @@ def test_parse_args_doctor_json():
     assert args.json_output is True
 
 
+def test_parse_args_setup_and_permissions():
+    setup = cli._parse_args([
+        "setup", "--client", "grok", "--permissions", "full", "--non-interactive"
+    ])
+    assert setup.command == "setup"
+    assert setup.client == "grok"
+    assert setup.permissions == "full"
+    permissions = cli._parse_args(["permissions", "set", "read-only"])
+    assert permissions.permissions_action == "set"
+    assert permissions.mode == "read-only"
+
+
 def test_doctor_runs_without_crashing(capsys):
     rc = cli.cmd_doctor()
     out = capsys.readouterr().out
@@ -398,6 +410,7 @@ def test_invalid_profile_is_rejected(profile):
         ("TERMUX_MCP_MCP_PORT", "70000"),
         ("TERMUX_MCP_TIMEOUT", "forever"),
         ("TERMUX_MCP_MAX_OUTPUT", "12"),
+        ("TERMUX_MCP_PERMISSIONS", "everything"),
     ],
 )
 def test_invalid_numeric_config_is_rejected(name, value):

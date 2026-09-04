@@ -16,6 +16,7 @@ set -euo pipefail
 
 STEP="初始化"
 INSTALL_LOG=""
+FIRST_INSTALL=0
 fail() {
   echo ""
   echo "=================================================="
@@ -149,6 +150,7 @@ ok "~/.config/termux-mcp  ~/.local/state/termux-mcp"
 STEP="生成配置"
 CONFIG="$HOME/.config/termux-mcp/config.env"
 if [ ! -f "$CONFIG" ]; then
+  FIRST_INSTALL=1
   log "首次运行：生成随机 AUTH TOKEN ..."
   TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
   {
@@ -172,20 +174,19 @@ STEP="自检"
 log "运行自检 (termux-mcp doctor) ..."
 termux-mcp doctor || true
 
-# ── 14. 成功信息 ────────────────────────────────────────────────────────────
+# ── 14. 首次连接 ────────────────────────────────────────────────────────────
+if [ "$FIRST_INSTALL" -eq 1 ] && [ "${TERMUX_MCP_SKIP_SETUP:-0}" != "1" ]; then
+  STEP="首次连接向导"
+  termux-mcp setup || fail "首次连接没有完成；稍后可运行 termux-mcp setup"
+fi
+
+# ── 15. 成功信息 ────────────────────────────────────────────────────────────
 echo ""
 echo "=================================================="
-echo " 安装完成！"
+echo " 安装完成！( Ꙭ)"
 echo "=================================================="
 echo ""
-echo "接下来你要做的："
-echo "  1. 启动（含公网隧道）:   termux-mcp start"
-echo "     只启动本地（无隧道）: termux-mcp start --no-tunnel"
-echo "  2. 查看状态:             termux-mcp status"
-echo "  3. 查看日志:             termux-mcp logs"
-echo "  4. 停止:                 termux-mcp stop"
-echo "  5. 查看 token:           termux-mcp token --show"
-echo ""
-echo "把 start 输出的 MCP public URL 填进你的 MCP 客户端，"
-echo "Authorization 头填: Bearer <你的 token>"
+if [ "$FIRST_INSTALL" -eq 0 ]; then
+  echo "已有配置保持不变。运行 termux-mcp status 查看状态。"
+fi
 echo ""

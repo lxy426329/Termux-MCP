@@ -3,10 +3,9 @@
 ## What it is
 
 Termux-MCP turns an Android phone running Termux into a remotely accessible MCP
-server for AI clients. The Python service exposes a deliberately limited set of
-device and shell capabilities through Streamable HTTP, with authentication,
-workspace boundaries, command-risk controls, process management, and optional
-public tunnels.
+gateway for AI clients. The Python service exposes device and shell capabilities
+through Streamable HTTP, can host or import other MCP servers, and lets the phone
+owner choose how much control the connected AI receives.
 
 It is not merely an Android port of an MCP server. Its product value is the
 complete path from a fresh phone to a controlled AI endpoint:
@@ -16,15 +15,15 @@ complete path from a fresh phone to a controlled AI endpoint:
 3. start the local REST and MCP endpoints;
 4. create and verify a public tunnel when requested;
 5. preserve credentials and runtime state across restarts;
-6. expose a small, reviewable tool surface rather than unrestricted device
-   automation by default.
+6. let the user paste one URL into ChatGPT, Claude, or Grok;
+7. let the connected AI install and operate additional MCP servers without
+   sending the user back to the terminal.
 
 ## Who it is for
 
-- developers who want an inexpensive, portable MCP host;
-- people experimenting with AI-to-Android workflows without maintaining a VPS;
-- users who need selected phone capabilities available to an MCP client;
-- educators and students who want a visible, inspectable MCP deployment.
+- people who found an MCP URL or GitHub project but do not know how to install it;
+- users who want ChatGPT, Claude, or Grok to operate an Android phone through one URL;
+- developers who want an inexpensive, portable MCP host.
 
 ## Why use this fork instead of the upstream project
 
@@ -35,20 +34,22 @@ deployment-focused product surface:
 | Area | This fork's focus |
 | --- | --- |
 | Protocol | Streamable HTTP MCP endpoint built on the official Python SDK |
-| Safety | bearer authentication, workspace confinement, symlink checks, command risk policy |
+| Permissions | owner-selected read-only, standard, or full control |
 | Architecture | REST and MCP share the same operation functions instead of proxying through localhost |
 | Reliability | managed server/tunnel state, health checks, persistent OAuth state, isolated profiles |
-| Onboarding | one-line bootstrap, one-command start, doctor output, zero-background tutorial |
+| Compatibility | remote HTTP/SSE import plus common Python and Node.js GitHub MCP projects |
+| Onboarding | one-line bootstrap, one short friendly setup, then one copy-ready URL |
 
 ## Product promise
 
-A new user should be able to paste one reviewed bootstrap command into a fresh
-Termux installation, receive an actionable error if the environment is broken,
-then run `termux-mcp start` and obtain the URL needed by an MCP client.
+A new user should paste one bootstrap command into a fresh Termux installation,
+choose an AI and permission level, and receive the one URL needed by the client.
+After that, normal installation and management should happen through conversation.
 
-The project should never hide security-sensitive behavior to make setup look
-simpler. Tokens remain local, dangerous shell actions remain governed by the
-existing risk policy, and public exposure is explicit and diagnosable.
+Compatibility is the default: imperfect third-party projects should get automatic
+runtime detection and a useful fallback path, not be rejected for packaging style.
+Security remains quiet infrastructure rather than onboarding friction. The owner
+can explicitly choose full control; standard mode retains command-risk prompts.
 
 ## Success criteria
 
@@ -57,5 +58,6 @@ existing risk policy, and public exposure is explicit and diagnosable.
 - every failed setup stage names the failed operation and a concrete next step;
 - start/stop/restart behavior does not silently invalidate a retained tunnel;
 - MCP and REST paths remain covered by shared-operation and security tests;
-- a zero-background user can reach a healthy endpoint from the README alone.
-
+- a zero-background user can reach a healthy endpoint from the README alone;
+- an attached AI can import a remote MCP or common GitHub MCP project and call it
+  without changing the client-facing gateway URL.

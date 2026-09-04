@@ -22,6 +22,10 @@ def isolated_config(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CONFIG_FILE", str(tmp_path / "cfg" / "config.env"))
     monkeypatch.setattr(config, "AUTH_TOKEN", "")
     monkeypatch.setattr(config, "REQUIRE_AUTH", False)
+    monkeypatch.setattr(config, "CLIENT_TARGET", "chatgpt")
+    monkeypatch.setattr(config, "PERMISSION_MODE", "standard")
+    monkeypatch.setattr(config, "SETUP_COMPLETE", False)
+    monkeypatch.setattr(config, "OAUTH_ISSUER", "")
     yield config
     config._FILE_VALUES.clear()
     config._FILE_VALUES.update(saved_values)
@@ -97,3 +101,17 @@ def test_token_command_hides_by_default(isolated_config, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "hidden-token-0123456789" not in out
     assert "configured" in out
+
+
+def test_save_user_preferences_persists_onboarding(isolated_config):
+    config.save_user_preferences("claude", "full")
+    assert config.CLIENT_TARGET == "claude"
+    assert config.PERMISSION_MODE == "full"
+    assert config.SETUP_COMPLETE is True
+    assert config.OAUTH_ISSUER == "auto"
+    with open(config.CONFIG_FILE, encoding="utf-8") as f:
+        content = f.read()
+    assert "TERMUX_MCP_CLIENT=claude" in content
+    assert "TERMUX_MCP_PERMISSIONS=full" in content
+    assert "TERMUX_MCP_SETUP_COMPLETE=1" in content
+    assert "TERMUX_MCP_OAUTH_ISSUER=auto" in content
