@@ -43,6 +43,8 @@ This fork adds a minimal, standards-compliant **MCP (Model Context Protocol)** l
 - **Persistent config**: `~/.config/termux-mcp/config.env` (chmod 600), token auto-generated on first start.
 - **Tests**: MCP authentication, workspace path traversal / symlink escape, dangerous & warning shell commands, REST/MCP shared-logic proof, launcher/tunnel/config unit tests, and a `tools/list` + `tools/call` smoke test.
 - **Live smoke script**: `scripts/mcp_smoke.py` validates the running server end-to-end.
+- **Bundled stdio example**: `examples/cute_demo_mcp.py` is a real three-tool MCP
+  server exercised end-to-end through the managed-MCP gateway in CI.
 - **Removed the stale upstream `.deb`** (`termux-mcp_1.0_all.deb`): it hardcoded `/usr/lib/python3.13/` and shipped the old upstream code without this fork's MCP layer. The supported install path is `bash scripts/install.sh` (pip-based, Python-version agnostic). `add-repo.sh` (upstream package repo) is kept for reference only.
 
 ---
