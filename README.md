@@ -224,6 +224,8 @@ termux-mcp restart
 | `termux-mcp start` | 启动服务器 + 自动隧道，打印 MCP URL |
 | `termux-mcp start --no-tunnel` | 只启动本地服务器 |
 | `termux-mcp start --tunnel cloudflare` | 指定隧道启动 |
+| `termux-mcp domain list` | 查看 Cloudflare 命名 Tunnel 的固定域名路由 |
+| `termux-mcp domain add mcp.example.com --port 8765 --tunnel my-tunnel` | 备份并校验配置后添加固定子域名，DNS 失败会自动重试 |
 | `termux-mcp stop` | 停止服务器和隧道 |
 | `termux-mcp restart` | 只重启服务器（**保留**正在运行的隧道和公网 URL） |
 | `termux-mcp restart --tunnel auto` | 重启服务器并**重建**隧道（旧行为） |

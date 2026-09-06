@@ -113,6 +113,20 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_permissions_set = permissions_sub.add_parser("set", help="Set permission mode")
     p_permissions_set.add_argument("mode", choices=["read-only", "standard", "full"])
 
+    p_domain = sub.add_parser("domain", help="Manage Cloudflare named-tunnel routes")
+    domain_sub = p_domain.add_subparsers(dest="domain_command", required=True)
+    p_domain_list = domain_sub.add_parser("list", help="List configured ingress routes")
+    p_domain_list.add_argument("--config", default=None)
+    p_domain_add = domain_sub.add_parser("add", help="Add and validate an ingress route")
+    p_domain_add.add_argument("hostname")
+    p_domain_add.add_argument("--port", type=int, required=True)
+    p_domain_add.add_argument("--tunnel", required=True)
+    p_domain_add.add_argument("--config", default=None)
+    p_domain_add.add_argument(
+        "--no-dns", action="store_true",
+        help="Update ingress only; do not create the Cloudflare DNS route",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -348,6 +362,36 @@ def cmd_permissions(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── Named domains ────────────────────────────────────────────────────────────
+
+def cmd_domain(args: argparse.Namespace) -> int:
+    from . import named_tunnel
+
+    path = args.config or named_tunnel.DEFAULT_CONFIG
+    try:
+        if args.domain_command == "list":
+            rules = named_tunnel.list_ingress(path)
+            if not rules:
+                print("No hostname ingress routes configured.")
+            for rule in rules:
+                print(f"{rule.hostname} -> {rule.service}")
+            return 0
+
+        backup = named_tunnel.add_ingress(args.hostname, args.port, path=path)
+        if backup:
+            print(f"Ingress added and validated. Backup: {backup}")
+        else:
+            print("Ingress already configured.")
+        if not args.no_dns:
+            named_tunnel.route_dns(args.tunnel, args.hostname)
+            print(f"DNS route ready: {args.hostname}")
+        print("Restart the named cloudflared tunnel to load the new ingress.")
+        return 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Domain error: {exc}", file=sys.stderr)
+        return 1
+
+
 # ── doctor ───────────────────────────────────────────────────────────────────
 
 def _pkg_version(name: str) -> Optional[str]:
@@ -555,6 +599,8 @@ def run(argv: Optional[List[str]] = None) -> int:
         return cmd_setup(args)
     if args.command == "permissions":
         return cmd_permissions(args)
+    if args.command == "domain":
+        return cmd_domain(args)
     return 0
 
 
