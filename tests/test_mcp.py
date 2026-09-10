@@ -39,6 +39,8 @@ EXPECTED_TOOLS = [
     "mcp_call",
     "mcp_remove",
     "run_steps",
+    "task_list",
+    "task_get",
 ]
 
 
@@ -117,6 +119,7 @@ def test_tools_list_and_call_smoke(mcp_server):
                 assert batch.isError is False
                 batch_text = batch.content[0].text
                 assert '"executed_steps": 2' in batch_text
+                assert '"task_id"' in batch_text
                 assert "one" in batch_text and "two" in batch_text
 
     asyncio.run(run())
