@@ -1,10 +1,4 @@
-"""Install and operate third-party MCP servers behind one Termux gateway.
-
-The first release intentionally supports the common happy paths:
-remote Streamable HTTP URLs, Python projects with ``pyproject.toml``, and
-Node projects with ``package.json``. A caller may provide an explicit command
-for unconventional repositories instead of being blocked by auto-detection.
-"""
+"""Install and operate third-party MCP servers behind one Termux gateway."""
 
 import json
 import re
@@ -19,6 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .config import CONFIG_DIR, HOME
+from . import managed_resilience
 
 REGISTRY_FILE = Path(CONFIG_DIR) / "managed_mcp.json"
 MANAGED_ROOT = Path(HOME) / ".local" / "share" / "termux-mcp" / "servers"
@@ -41,10 +36,7 @@ def _load_registry() -> dict[str, dict[str, Any]]:
 def _save_registry(registry: dict[str, dict[str, Any]]) -> None:
     REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = REGISTRY_FILE.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    tmp.write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     try:
         tmp.chmod(0o600)
     except OSError:
@@ -63,38 +55,28 @@ def _default_name(source: str) -> str:
 def _validated_name(name: str) -> str:
     value = name.strip().lower()
     if not _NAME_RE.fullmatch(value):
-        raise ManagedMCPError(
-            "name must use 1-48 lowercase letters, digits, underscores, or hyphens"
-        )
+        raise ManagedMCPError("name must use 1-48 lowercase letters, digits, underscores, or hyphens")
     return value
 
 
 def _run(argv: list[str], cwd: Path | None = None) -> str:
     try:
-        completed = subprocess.run(
-            argv,
-            cwd=str(cwd) if cwd else None,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=None,
-            check=False,
-        )
+        completed = subprocess.run(argv, cwd=str(cwd) if cwd else None, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   timeout=None, check=False)
     except OSError as exc:
         raise ManagedMCPError(f"could not run {argv[0]}: {exc}") from exc
     output = completed.stdout or ""
     if completed.returncode:
         tail = "\n".join(output.splitlines()[-30:])
-        raise ManagedMCPError(
-            f"command failed ({completed.returncode}): {' '.join(argv)}\n{tail}"
-        )
+        raise ManagedMCPError(f"command failed ({completed.returncode}): {' '.join(argv)}\n{tail}")
     return output
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
     try:
         import tomllib
-    except ImportError:  # Python 3.10
+    except ImportError:
         import tomli as tomllib  # type: ignore[no-redef]
     try:
         with path.open("rb") as stream:
@@ -111,15 +93,11 @@ def _install_python(source_dir: Path) -> tuple[list[str], str]:
     data = _read_toml(source_dir / "pyproject.toml")
     scripts = data.get("project", {}).get("scripts", {})
     if isinstance(scripts, dict) and scripts:
-        executable = environment / "bin" / next(iter(scripts))
-        return [str(executable)], "python"
+        return [str(environment / "bin" / next(iter(scripts)))], "python"
     for candidate in ("server.py", "main.py", "app.py"):
         if (source_dir / candidate).is_file():
             return [str(python), candidate], "python"
-    raise ManagedMCPError(
-        "Python project installed, but no project script/server.py/main.py was found; "
-        "retry with an explicit command"
-    )
+    raise ManagedMCPError("Python project installed, but no project script/server.py/main.py was found; retry with an explicit command")
 
 
 def _install_node(source_dir: Path) -> tuple[list[str], str]:
@@ -143,10 +121,7 @@ def _install_node(source_dir: Path) -> tuple[list[str], str]:
     for candidate in (package.get("main"), "dist/index.js", "build/index.js", "index.js"):
         if candidate and (source_dir / candidate).is_file():
             return ["node", str(candidate)], "node"
-    raise ManagedMCPError(
-        "Node project installed, but no bin/start/main entry was found; "
-        "retry with an explicit command"
-    )
+    raise ManagedMCPError("Node project installed, but no bin/start/main entry was found; retry with an explicit command")
 
 
 def _github_repo(source: str) -> str | None:
@@ -159,13 +134,7 @@ def _github_repo(source: str) -> str | None:
     return f"https://github.com/{parts[0]}/{parts[1].removesuffix('.git')}.git"
 
 
-def install(
-    source: str,
-    name: str = "",
-    command: str = "",
-    authorization: str = "",
-) -> dict[str, Any]:
-    """Register a remote URL or clone and prepare a GitHub MCP project."""
+def install(source: str, name: str = "", command: str = "", authorization: str = "") -> dict[str, Any]:
     source = source.strip()
     if not source:
         raise ManagedMCPError("source URL is required")
@@ -173,24 +142,14 @@ def install(
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ManagedMCPError("source must be an http(s) MCP or GitHub URL")
     server_name = _validated_name(name or _default_name(source))
-
     with _LOCK:
         registry = _load_registry()
         if server_name in registry:
-            raise ManagedMCPError(
-                f"{server_name!r} already exists; remove it or choose another name"
-            )
-
+            raise ManagedMCPError(f"{server_name!r} already exists; remove it or choose another name")
         github = _github_repo(source)
         if github is None:
-            entry: dict[str, Any] = {
-                "name": server_name,
-                "source": source,
-                "transport": "http",
-                "url": source,
-                "authorization": authorization.strip(),
-                "installed_at": int(time.time()),
-            }
+            entry = {"name": server_name, "source": source, "transport": "http", "url": source,
+                     "authorization": authorization.strip(), "installed_at": int(time.time())}
         else:
             server_root = MANAGED_ROOT / server_name
             source_dir = server_root / "source"
@@ -209,22 +168,12 @@ def install(
                 elif (source_dir / "package.json").is_file():
                     argv, runtime = _install_node(source_dir)
                 else:
-                    raise ManagedMCPError(
-                        "could not detect Python or Node project; retry with an explicit command"
-                    )
+                    raise ManagedMCPError("could not detect Python or Node project; retry with an explicit command")
             except Exception:
                 shutil.rmtree(server_root, ignore_errors=True)
                 raise
-            entry = {
-                "name": server_name,
-                "source": source,
-                "transport": "stdio",
-                "command": argv,
-                "cwd": str(source_dir),
-                "runtime": runtime,
-                "installed_at": int(time.time()),
-            }
-
+            entry = {"name": server_name, "source": source, "transport": "stdio", "command": argv,
+                     "cwd": str(source_dir), "runtime": runtime, "installed_at": int(time.time())}
         registry[server_name] = entry
         _save_registry(registry)
     return _public_entry(entry)
@@ -239,10 +188,12 @@ def _public_entry(entry: dict[str, Any]) -> dict[str, Any]:
 
 def list_servers() -> dict[str, Any]:
     registry = _load_registry()
-    return {
-        "servers": [_public_entry(registry[name]) for name in sorted(registry)],
-        "count": len(registry),
-    }
+    return {"servers": [_public_entry(registry[name]) for name in sorted(registry)], "count": len(registry)}
+
+
+def search(query: str = "") -> dict[str, Any]:
+    """Search installed MCPs plus the last-known-good catalogue of their tools."""
+    return managed_resilience.search(query, list_servers()["servers"])
 
 
 def _entry(name: str) -> dict[str, Any]:
@@ -255,85 +206,68 @@ def _entry(name: str) -> dict[str, Any]:
 
 async def _session(entry: dict[str, Any], operation) -> Any:
     from mcp.client.session import ClientSession
-
     if entry["transport"] == "http":
         from mcp.client.streamable_http import streamablehttp_client
-
         headers = {}
         if entry.get("authorization"):
             value = entry["authorization"]
-            headers["Authorization"] = (
-                value if value.lower().startswith("bearer ") else f"Bearer {value}"
-            )
+            headers["Authorization"] = value if value.lower().startswith("bearer ") else f"Bearer {value}"
         initialized = False
         try:
-            async with (
-                streamablehttp_client(entry["url"], headers=headers) as streams,
-                ClientSession(streams[0], streams[1]) as session,
-            ):
+            async with (streamablehttp_client(entry["url"], headers=headers) as streams,
+                        ClientSession(streams[0], streams[1]) as session):
                 await session.initialize()
                 initialized = True
                 return await operation(session)
         except Exception as streamable_error:
-            # Compatibility-first: many older public MCP projects still expose
-            # SSE. Only fall back when the Streamable HTTP handshake itself
-            # failed; never repeat a tool call that failed after initialization.
             if initialized:
                 raise
             try:
                 from mcp.client.sse import sse_client
-
-                async with (
-                    sse_client(entry["url"], headers=headers) as streams,
-                    ClientSession(streams[0], streams[1]) as session,
-                ):
+                async with (sse_client(entry["url"], headers=headers) as streams,
+                            ClientSession(streams[0], streams[1]) as session):
                     await session.initialize()
                     return await operation(session)
             except Exception as sse_error:
-                raise ManagedMCPError(
-                    "remote MCP connection failed with Streamable HTTP and SSE: "
-                    f"{streamable_error}; {sse_error}"
-                ) from sse_error
-
+                raise ManagedMCPError("remote MCP connection failed with Streamable HTTP and SSE: "
+                                      f"{streamable_error}; {sse_error}") from sse_error
     from mcp.client.stdio import StdioServerParameters, stdio_client
-
     argv = entry["command"]
     params = StdioServerParameters(command=argv[0], args=argv[1:], cwd=entry["cwd"])
-    async with (
-        stdio_client(params) as streams,
-        ClientSession(streams[0], streams[1]) as session,
-    ):
+    async with (stdio_client(params) as streams, ClientSession(streams[0], streams[1]) as session):
         await session.initialize()
         return await operation(session)
 
 
 async def inspect(name: str) -> dict[str, Any]:
+    """Inspect with retry; fall back to last-known-good catalogue on transient failure."""
     entry = _entry(name)
-
-    async def operation(session):
-        result = await session.list_tools()
-        return {
-            "name": entry["name"],
-            "transport": entry["transport"],
-            "tools": [
-                {"name": tool.name, "description": tool.description or ""}
-                for tool in result.tools
-            ],
-            "count": len(result.tools),
-        }
-
-    return await _session(entry, operation)
+    async def once():
+        async def operation(session):
+            result = await session.list_tools()
+            tools = [{"name": tool.name, "description": tool.description or ""} for tool in result.tools]
+            return {"name": entry["name"], "transport": entry["transport"], "tools": tools, "count": len(tools)}
+        return await _session(entry, operation)
+    result, error, attempts = await managed_resilience.retry(once)
+    if result is not None:
+        managed_resilience.remember(entry["name"], entry["transport"], result["tools"])
+        result.update({"health": "online", "stale": False, "attempts": attempts})
+        return result
+    snapshot = managed_resilience.cached(entry["name"])
+    if snapshot:
+        return {**snapshot, "health": "degraded", "stale": True, "attempts": attempts,
+                "error": str(error), "message": "live inspection failed; returning last-known-good tool catalogue"}
+    raise ManagedMCPError(f"inspection failed after {attempts} attempts: {error}")
 
 
 async def call(name: str, tool: str, arguments: dict[str, Any] | None = None) -> dict:
+    """Call a tool once. Calls are never automatically replayed because they may have side effects."""
     entry = _entry(name)
-
     async def operation(session):
         result = await session.call_tool(tool, arguments or {})
         if hasattr(result, "model_dump"):
             return result.model_dump(mode="json")
         return {"result": str(result)}
-
     return await _session(entry, operation)
 
 
@@ -353,4 +287,5 @@ def remove(name: str) -> dict[str, Any]:
             server_root.replace(destination)
             recovered_to = str(destination)
         _save_registry(registry)
+        managed_resilience.forget(name)
     return {"removed": name, "recoverable_from": recovered_to or None}
