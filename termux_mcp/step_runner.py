@@ -2,13 +2,15 @@
 
 The runner deliberately does not invent plans or replay failed side-effecting
 steps. It executes an explicit list supplied by the caller and returns once at
-the end. Output can be compacted so deterministic intermediate stdout does not
-consume the chat model's context budget.
+the end. Full results can be persisted locally while compact output is returned
+to the chat model, reducing context cost without losing debuggability.
 """
 
 import asyncio
 import time
 from typing import Any, Awaitable, Callable
+
+from . import task_log
 
 MAX_STEPS = 20
 DEFAULT_STEP_TIMEOUT = 30.0
@@ -106,11 +108,15 @@ def _compact_value(value: Any, *, string_limit: int, list_limit: int, depth: int
     return value
 
 
-def _render_result(item: dict[str, Any], output_mode: str) -> dict[str, Any]:
+def render_payload(payload: dict[str, Any], output_mode: str) -> dict[str, Any]:
+    """Render a stored/full payload for a requested context-cost level."""
+    output_mode = str(output_mode).strip().lower()
+    if output_mode not in OUTPUT_MODES:
+        raise StepRunnerError("output_mode must be compact, normal, or full")
     if output_mode == "full":
-        return item
+        return payload
     limits = (1200, 12) if output_mode == "normal" else (400, 6)
-    return _compact_value(item, string_limit=limits[0], list_limit=limits[1])
+    return _compact_value(payload, string_limit=limits[0], list_limit=limits[1])
 
 
 async def run_steps(
@@ -120,6 +126,7 @@ async def run_steps(
     stop_on_error: bool = True,
     step_timeout: float = DEFAULT_STEP_TIMEOUT,
     output_mode: str = "compact",
+    persist_log: bool = True,
 ) -> dict[str, Any]:
     """Execute explicit steps sequentially and return one aggregate response."""
     if not isinstance(steps, list) or not steps:
@@ -190,7 +197,7 @@ async def run_steps(
     executed = [item for item in results if not item.get("skipped")]
     succeeded = sum(1 for item in executed if item["ok"])
     failed_count = len(executed) - succeeded
-    return {
+    full_payload = {
         "ok": failed_count == 0 and not stopped,
         "requested_steps": len(steps),
         "executed_steps": len(executed),
@@ -198,7 +205,13 @@ async def run_steps(
         "succeeded": succeeded,
         "failed": failed_count,
         "stopped_early": stopped,
-        "output_mode": output_mode,
         "duration_ms": round((time.monotonic() - started) * 1000),
-        "results": [_render_result(item, output_mode) for item in results],
+        "results": results,
     }
+    task_id = task_log.save(full_payload) if persist_log else None
+    rendered = render_payload(full_payload, output_mode)
+    rendered["output_mode"] = output_mode
+    if task_id:
+        rendered["task_id"] = task_id
+        rendered["details_hint"] = "Use task_get(task_id, step=N) for full local details."
+    return rendered
