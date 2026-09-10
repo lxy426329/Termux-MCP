@@ -15,7 +15,7 @@ def test_run_steps_collects_results_without_intermediate_return():
     result = asyncio.run(run_steps([
         {"tool": "one", "arguments": {"value": 1}},
         {"tool": "two", "arguments": {"value": 2}},
-    ], dispatch))
+    ], dispatch, output_mode="full"))
 
     assert calls == [("one", {"value": 1}), ("two", {"value": 2})]
     assert result["ok"] is True
@@ -66,7 +66,7 @@ def test_run_steps_treats_confirmation_as_stop():
     assert result["results"][0]["ok"] is False
 
 
-def test_run_steps_validates_limits():
+def test_run_steps_validates_limits_and_output_mode():
     async def dispatch(tool, arguments):
         return {}
 
@@ -74,3 +74,43 @@ def test_run_steps_validates_limits():
         asyncio.run(run_steps([], dispatch))
     with pytest.raises(StepRunnerError):
         asyncio.run(run_steps([{"tool": "x"}] * (MAX_STEPS + 1), dispatch))
+    with pytest.raises(StepRunnerError):
+        asyncio.run(run_steps([{"tool": "x"}], dispatch, output_mode="giant"))
+
+
+def test_compact_output_trims_large_intermediate_text():
+    async def dispatch(tool, arguments):
+        return {"stdout": "x" * 5000, "exit_code": 0}
+
+    result = asyncio.run(run_steps([{"tool": "shell"}], dispatch))
+    stdout = result["results"][0]["result"]["stdout"]
+    assert len(stdout) < 1000
+    assert "chars omitted" in stdout
+    assert result["output_mode"] == "compact"
+
+
+def test_full_output_preserves_large_intermediate_text():
+    async def dispatch(tool, arguments):
+        return {"stdout": "x" * 5000, "exit_code": 0}
+
+    result = asyncio.run(run_steps([{"tool": "shell"}], dispatch, output_mode="full"))
+    assert len(result["results"][0]["result"]["stdout"]) == 5000
+
+
+def test_conditional_step_can_skip_from_previous_result():
+    calls = []
+
+    async def dispatch(tool, arguments):
+        calls.append(tool)
+        return {"exit_code": 0, "value": tool}
+
+    result = asyncio.run(run_steps([
+        {"tool": "check"},
+        {"tool": "repair", "when": {"step": 1, "path": "result.exit_code", "equals": 1}},
+        {"tool": "verify", "when": {"step": 1, "path": "ok", "equals": True}},
+    ], dispatch, output_mode="full"))
+
+    assert calls == ["check", "verify"]
+    assert result["skipped_steps"] == 1
+    assert result["results"][1]["skipped"] is True
+    assert result["ok"] is True
