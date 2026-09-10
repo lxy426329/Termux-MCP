@@ -272,14 +272,27 @@ async def _dispatch_step(name: str, arguments: dict):
     return value
 
 
-async def tool_run_steps(steps: list[dict], stop_on_error: bool = True, step_timeout: float = 30.0) -> dict:
-    """Execute up to 20 explicit tool steps sequentially and return once at the end."""
+async def tool_run_steps(
+    steps: list[dict],
+    stop_on_error: bool = True,
+    step_timeout: float = 30.0,
+    output_mode: str = "compact",
+) -> dict:
+    """Execute up to 20 explicit steps and return once at the end.
+
+    output_mode controls context cost: compact (default) trims large
+    intermediate payloads, normal keeps more detail, and full is intended for
+    debugging. A step may include a safe declarative `when` condition that
+    references an earlier step, for example:
+    {"when": {"step": 1, "path": "result.exit_code", "equals": 0}}.
+    """
     try:
         return await step_runner.run_steps(
             steps,
             _dispatch_step,
             stop_on_error=stop_on_error,
             step_timeout=step_timeout,
+            output_mode=output_mode,
         )
     except step_runner.StepRunnerError as exc:
         return {"error": str(exc), "executed_steps": 0}
