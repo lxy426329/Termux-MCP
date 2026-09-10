@@ -260,6 +260,59 @@ async def inspect(name: str) -> dict[str, Any]:
     raise ManagedMCPError(f"inspection failed after {attempts} attempts: {error}")
 
 
+async def health(name: str = "") -> dict[str, Any]:
+    """Check one or all managed MCPs using resilient inspection.
+
+    `online` means a live catalogue was retrieved, `degraded` means the live
+    check failed but a last-known-good catalogue is available, and `offline`
+    means neither live inspection nor a cached catalogue was usable.
+    """
+    registry = _load_registry()
+    if name:
+        names = [_validated_name(name)]
+        if names[0] not in registry:
+            raise ManagedMCPError(f"managed MCP {names[0]!r} was not found")
+    else:
+        names = sorted(registry)
+
+    checks = []
+    for server_name in names:
+        started = time.monotonic()
+        try:
+            result = await inspect(server_name)
+            checks.append({
+                "name": server_name,
+                "health": result.get("health", "online"),
+                "stale": bool(result.get("stale")),
+                "tool_count": result.get("count", len(result.get("tools", []))),
+                "attempts": result.get("attempts", 1),
+                "latency_ms": round((time.monotonic() - started) * 1000),
+                "error": result.get("error"),
+            })
+        except Exception as exc:
+            checks.append({
+                "name": server_name,
+                "health": "offline",
+                "stale": False,
+                "tool_count": 0,
+                "attempts": managed_resilience.DEFAULT_RETRIES + 1,
+                "latency_ms": round((time.monotonic() - started) * 1000),
+                "error": str(exc),
+            })
+
+    counts = {"online": 0, "degraded": 0, "offline": 0}
+    for item in checks:
+        counts[item["health"]] = counts.get(item["health"], 0) + 1
+    overall = "online"
+    if counts["offline"]:
+        overall = "offline" if counts["offline"] == len(checks) else "degraded"
+    elif counts["degraded"]:
+        overall = "degraded"
+    if not checks:
+        overall = "empty"
+    return {"health": overall, "count": len(checks), "counts": counts, "servers": checks}
+
+
 async def call(name: str, tool: str, arguments: dict[str, Any] | None = None) -> dict:
     """Call a tool once. Calls are never automatically replayed because they may have side effects."""
     entry = _entry(name)
