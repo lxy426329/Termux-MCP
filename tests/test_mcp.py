@@ -1,9 +1,4 @@
-"""Tests for the MCP Streamable HTTP layer.
-
-The MCP app is served by a real uvicorn server (lifespan runs the session
-manager's task group), then exercised with plain HTTP for auth checks and
-with the official SDK client for tools/list + tools/call smoke tests.
-"""
+"""Tests for the MCP Streamable HTTP layer."""
 
 import asyncio
 import socket
@@ -38,9 +33,11 @@ EXPECTED_TOOLS = [
     "board_status",
     "mcp_install",
     "mcp_list",
+    "mcp_search",
     "mcp_inspect",
     "mcp_call",
     "mcp_remove",
+    "run_steps",
 ]
 
 
@@ -61,7 +58,6 @@ def mcp_server():
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     url = f"http://127.0.0.1:{port}/mcp"
-    # Wait for the server to accept connections.
     for _ in range(100):
         try:
             httpx.get(url, timeout=0.3)
@@ -73,38 +69,23 @@ def mcp_server():
     thread.join(timeout=5)
 
 
-# ── Authentication ───────────────────────────────────────────────────────────
-
 def test_mcp_requires_auth(mcp_server):
-    r = httpx.post(mcp_server, json={})
-    assert r.status_code == 401
+    assert httpx.post(mcp_server, json={}).status_code == 401
 
 
 def test_mcp_rejects_wrong_token(mcp_server):
-    r = httpx.post(
-        mcp_server, json={},
-        headers={"Authorization": "Bearer wrong-token-0000000000000000"},
-    )
+    r = httpx.post(mcp_server, json={}, headers={"Authorization": "Bearer wrong-token-0000000000000000"})
     assert r.status_code == 401
 
 
 def test_mcp_accepts_valid_token(mcp_server):
-    r = httpx.post(
-        mcp_server, json={},
-        headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
-    )
-    # Passes the auth middleware; the MCP layer answers with its own
-    # protocol-level response (never 401).
+    r = httpx.post(mcp_server, json={}, headers={"Authorization": f"Bearer {AUTH_TOKEN}"})
     assert r.status_code != 401
 
 
 def test_mcp_rejects_token_in_query_string(mcp_server):
-    # Tokens in URL query parameters must NOT be supported.
-    r = httpx.post(f"{mcp_server}?token={AUTH_TOKEN}", json={})
-    assert r.status_code == 401
+    assert httpx.post(f"{mcp_server}?token={AUTH_TOKEN}", json={}).status_code == 401
 
-
-# ── Smoke: tools/list + tools/call ──────────────────────────────────────────
 
 def test_tools_list_and_call_smoke(mcp_server):
     from mcp.client.session import ClientSession
@@ -112,25 +93,30 @@ def test_tools_list_and_call_smoke(mcp_server):
 
     async def run():
         async with streamablehttp_client(
-            mcp_server,
-            headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+            mcp_server, headers={"Authorization": f"Bearer {AUTH_TOKEN}"}
         ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-
-                # tools/list
                 tools = await session.list_tools()
-                names = [t.name for t in tools.tools]
-                assert names == EXPECTED_TOOLS
+                assert [t.name for t in tools.tools] == EXPECTED_TOOLS
 
-                # tools/call — run_command returns structured JSON
                 res = await session.call_tool("run_command", {"cmd": "echo hello"})
                 assert res.isError is False
                 text = res.content[0].text
-                for key in ("stdout", "stderr", "exit_code", "truncated",
-                            "risk_level", "snapshots"):
+                for key in ("stdout", "stderr", "exit_code", "truncated", "risk_level", "snapshots"):
                     assert f'"{key}"' in text
                 assert "hello" in text
+
+                batch = await session.call_tool("run_steps", {
+                    "steps": [
+                        {"tool": "run_command", "arguments": {"cmd": "echo one"}},
+                        {"tool": "run_command", "arguments": {"cmd": "echo two"}},
+                    ]
+                })
+                assert batch.isError is False
+                batch_text = batch.content[0].text
+                assert '"executed_steps": 2' in batch_text
+                assert "one" in batch_text and "two" in batch_text
 
     asyncio.run(run())
 
@@ -141,8 +127,7 @@ def test_tools_call_dangerous_blocked(mcp_server):
 
     async def run():
         async with streamablehttp_client(
-            mcp_server,
-            headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+            mcp_server, headers={"Authorization": f"Bearer {AUTH_TOKEN}"}
         ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
@@ -160,8 +145,7 @@ def test_tools_call_warning_confirmation_required(mcp_server):
 
     async def run():
         async with streamablehttp_client(
-            mcp_server,
-            headers={"Authorization": f"Bearer {AUTH_TOKEN}"},
+            mcp_server, headers={"Authorization": f"Bearer {AUTH_TOKEN}"}
         ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
