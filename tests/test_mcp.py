@@ -35,6 +35,7 @@ EXPECTED_TOOLS = [
     "mcp_list",
     "mcp_search",
     "mcp_inspect",
+    "mcp_health",
     "mcp_call",
     "mcp_remove",
     "run_steps",
