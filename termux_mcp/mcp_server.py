@@ -1,17 +1,6 @@
-"""Minimal standards-compliant MCP layer for termux-mcp.
+"""Standards-compliant MCP layer for termux-mcp."""
 
-Exposes built-in device tools and managed-MCP control tools over Streamable HTTP using the
-official `mcp` Python SDK. The tools call the same shared operations as
-the REST API (termux_mcp.operations) directly — they never proxy through
-the REST HTTP API.
-
-Security:
-  * Authorization: Bearer only (no tokens in URL query parameters).
-  * Command behavior follows the permission level chosen by the device owner.
-  * Optional workspace root restriction for filesystem tools, enforced
-    with realpath resolution.
-"""
-
+import inspect
 import logging
 import threading
 import time
@@ -21,28 +10,24 @@ from . import config
 from . import managed_mcp
 from . import operations
 from . import permissions
-from . import walnut_inbox
+from . import step_runner
 from . import walnut_board
+from . import walnut_inbox
 from .auth import get_auth_provider
 from .config import MCP_HOST, MCP_PORT, WORKSPACE_ROOT
 
 logger = logging.getLogger(__name__)
 
-# DNS rebinding protection (mcp SDK TransportSecuritySettings). localhost is
-# always allowed; the current trusted public tunnel host is added at runtime
-# once the CLI has verified a tunnel URL (see _watch_public_url). Hosts are
-# never derived from Host / X-Forwarded-* request headers.
 _LOCALHOST_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
 _LOCALHOST_ORIGINS = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
 _PUBLIC_URL_POLL_INTERVAL = 2.0
 
-_transport_security = None  # TransportSecuritySettings instance shared with FastMCP
-_transport_watcher = None   # daemon thread syncing allowed_hosts with the runtime URL
+_transport_security = None
+_transport_watcher = None
 _transport_lock = threading.Lock()
 
 
 def _host_entries_for_url(url: str) -> list:
-    """allowed_hosts entries (host + host:*) for a trusted public base URL."""
     host = urlparse(url).hostname
     if not host:
         return []
@@ -50,11 +35,6 @@ def _host_entries_for_url(url: str) -> list:
 
 
 def _apply_public_url(settings, url: str) -> None:
-    """Replace allowed_hosts with localhost + the current trusted public host.
-
-    Replaces (never appends) so a changed tunnel hostname does not leave the
-    previous host trusted indefinitely.
-    """
     entries = list(_LOCALHOST_HOSTS)
     if url:
         entries.extend(_host_entries_for_url(url))
@@ -62,12 +42,6 @@ def _apply_public_url(settings, url: str) -> None:
 
 
 def _watch_public_url(settings) -> None:
-    """Daemon loop: keep allowed_hosts in sync with the runtime public URL.
-
-    The MCP server can start before the CLI tunnel succeeds, so the trusted
-    public host is learned from the runtime public-URL registry (written by
-    the CLI only after a tunnel is verified) rather than from request headers.
-    """
     current = None
     while True:
         try:
@@ -81,7 +55,6 @@ def _watch_public_url(settings) -> None:
 
 
 def _start_transport_security_watcher() -> None:
-    """Start the public-URL watcher thread once (production server only)."""
     global _transport_watcher
     if _transport_security is None:
         return
@@ -96,19 +69,10 @@ def _start_transport_security_watcher() -> None:
             _transport_watcher.start()
 
 
-# ── MCP tools (module-level so tests can call them directly) ─────────────────
-
 def tool_run_command(cmd: str, confirmed: bool = False) -> dict:
-    """Run a shell command on the device and return its output.
-
-    Dangerous commands are blocked outright. Warning-level commands
-    (e.g. rm -rf) require `confirmed=True` and otherwise return a
-    structured confirmation-required response.
-    """
+    """Run a shell command and return structured output."""
     if not permissions.allows("command.run"):
         return permissions.denied("command.run")
-    # Full mode is an explicit device-owner decision. It intentionally skips
-    # repeated confirmation prompts while retaining snapshots/output limits.
     assessment = operations.assess_command(
         cmd, confirmed or permissions.current_mode() == "full"
     )
@@ -153,132 +117,99 @@ def tool_run_command(cmd: str, confirmed: bool = False) -> dict:
 
 
 def tool_read_file(path: str, offset: int = 0, limit: int = 500) -> dict:
-    """Read a text file with line offset/limit support."""
     return operations.read_file(path, offset=offset, limit=limit, workspace=WORKSPACE_ROOT)
 
 
 def tool_write_file(path: str, content: str) -> dict:
-    """Write text content to a file. The previous version is snapshotted."""
     if not permissions.allows("filesystem.write"):
         return permissions.denied("filesystem.write")
     return operations.write_file(path, content, workspace=WORKSPACE_ROOT)
 
 
 def tool_list_files(path: str = ".") -> dict:
-    """List directory entries (including dotfiles)."""
     return operations.list_files(path, workspace=WORKSPACE_ROOT)
 
 
 def tool_make_directory(path: str) -> dict:
-    """Create a directory (and any missing parents)."""
     if not permissions.allows("filesystem.write"):
         return permissions.denied("filesystem.write")
     return operations.make_directory(path, workspace=WORKSPACE_ROOT)
 
 
 def tool_get_location(provider: str = "gps") -> dict:
-    """Get the device's last known location."""
     return operations.get_location(provider)
 
 
 def tool_get_battery() -> dict:
-    """Get battery status."""
     return operations.get_battery()
 
 
-def tool_send_notification(
-    title: str = "TermuxGPT",
-    content: str = "",
-    priority: str = "default",
-) -> dict:
-    """Send a device notification."""
+def tool_send_notification(title: str = "TermuxGPT", content: str = "", priority: str = "default") -> dict:
     if not permissions.allows("device.write"):
         return permissions.denied("device.write")
     return operations.send_notification(title, content, priority)
 
 
-def tool_inbox_list(status: str = 'pending', limit: int = 20, source: str = '') -> dict:
-    '''List Walnut Inbox events in wake-friendly priority order.'''
+def tool_inbox_list(status: str = "pending", limit: int = 20, source: str = "") -> dict:
     return walnut_inbox.list_events(status=status, limit=limit, source=source or None)
 
 
 def tool_inbox_get(event_id: str) -> dict:
-    '''Read one Walnut Inbox event.'''
     return walnut_inbox.get_event(event_id)
 
 
-def tool_inbox_ack(event_id: str, note: str = '') -> dict:
-    '''Acknowledge a Walnut Inbox event after handling or deliberate ignore.'''
+def tool_inbox_ack(event_id: str, note: str = "") -> dict:
     return walnut_inbox.ack_event(event_id, note)
 
 
 def tool_inbox_status() -> dict:
-    '''Show Walnut Inbox counts and latest event.'''
     return walnut_inbox.status()
 
 
-def tool_board_add(title: str, description: str = '', category: str = 'general', priority: str = 'normal', status: str = 'idea', owner: str = 'qian', effort: str = 'normal', next_step: str = '', notes: str = '') -> dict:
-    '''Add a task to the Walnut Board.'''
+def tool_board_add(title: str, description: str = "", category: str = "general", priority: str = "normal", status: str = "idea", owner: str = "qian", effort: str = "normal", next_step: str = "", notes: str = "") -> dict:
     return walnut_board.add_task(title, description, category, priority, status, owner, effort, next_step, notes)
 
 
-def tool_board_list(status: str = 'open', owner: str = 'all', limit: int = 50, effort: str = 'all') -> dict:
-    '''List Walnut Board tasks.'''
+def tool_board_list(status: str = "open", owner: str = "all", limit: int = 50, effort: str = "all") -> dict:
     return walnut_board.list_tasks(status=status, owner=owner, limit=limit, effort=effort)
 
 
 def tool_board_get(task_id: str) -> dict:
-    '''Read one Walnut Board task.'''
     return walnut_board.get_task(task_id)
 
 
-def tool_board_update(task_id: str, status: str = '', priority: str = '', effort: str = '', next_step: str = '', notes: str = '', touch: bool = True) -> dict:
-    '''Update status or working metadata for a Walnut Board task.'''
+def tool_board_update(task_id: str, status: str = "", priority: str = "", effort: str = "", next_step: str = "", notes: str = "", touch: bool = True) -> dict:
     return walnut_board.update_task(task_id, status, priority, effort, next_step, notes, touch)
 
 
 def tool_board_status() -> dict:
-    '''Show Walnut Board counts.'''
     return walnut_board.status()
 
 
 def tool_permissions_status() -> dict:
-    """Show the permission level chosen locally by the device owner."""
     return permissions.status()
 
 
-def tool_mcp_install(
-    source: str,
-    name: str = "",
-    command: str = "",
-    authorization: str = "",
-) -> dict:
-    """Install a remote MCP URL or GitHub MCP repository.
-
-    For unusual GitHub projects, pass the repository's documented stdio
-    launch command. The server is then available through mcp_inspect and
-    mcp_call without asking the user to return to Termux.
-    """
+def tool_mcp_install(source: str, name: str = "", command: str = "", authorization: str = "") -> dict:
     if not permissions.allows("managed.install"):
         return permissions.denied("managed.install")
     try:
         entry = managed_mcp.install(source, name, command, authorization)
-        return {
-            "installed": True,
-            "server": entry,
-            "next": f"Call mcp_inspect with name={entry['name']!r}",
-        }
+        return {"installed": True, "server": entry, "next": f"Call mcp_inspect with name={entry['name']!r}"}
     except managed_mcp.ManagedMCPError as exc:
         return {"installed": False, "error": str(exc)}
 
 
 def tool_mcp_list() -> dict:
-    """List MCP servers managed by this Termux gateway."""
     return managed_mcp.list_servers()
 
 
+def tool_mcp_search(query: str = "") -> dict:
+    """Search installed MCP server names and cached tool metadata."""
+    return managed_mcp.search(query)
+
+
 async def tool_mcp_inspect(name: str) -> dict:
-    """Connect to a managed MCP server and list its available tools."""
     try:
         return await managed_mcp.inspect(name)
     except Exception as exc:
@@ -286,7 +217,6 @@ async def tool_mcp_inspect(name: str) -> dict:
 
 
 async def tool_mcp_call(name: str, tool: str, arguments: dict = None) -> dict:
-    """Call a tool exposed by an installed or imported MCP server."""
     if not permissions.allows("managed.call"):
         return permissions.denied("managed.call")
     try:
@@ -296,7 +226,6 @@ async def tool_mcp_call(name: str, tool: str, arguments: dict = None) -> dict:
 
 
 def tool_mcp_remove(name: str) -> dict:
-    """Remove a managed MCP registration and archive its local files."""
     if not permissions.allows("managed.remove"):
         return permissions.denied("managed.remove")
     try:
@@ -305,46 +234,74 @@ def tool_mcp_remove(name: str) -> dict:
         return {"error": str(exc), "server": name}
 
 
-# ── App construction ─────────────────────────────────────────────────────────
+_STEP_TOOLS = {
+    "run_command": tool_run_command,
+    "read_file": tool_read_file,
+    "write_file": tool_write_file,
+    "list_files": tool_list_files,
+    "make_directory": tool_make_directory,
+    "get_location": tool_get_location,
+    "get_battery": tool_get_battery,
+    "send_notification": tool_send_notification,
+    "permissions_status": tool_permissions_status,
+    "inbox_list": tool_inbox_list,
+    "inbox_get": tool_inbox_get,
+    "inbox_ack": tool_inbox_ack,
+    "inbox_status": tool_inbox_status,
+    "board_add": tool_board_add,
+    "board_list": tool_board_list,
+    "board_get": tool_board_get,
+    "board_update": tool_board_update,
+    "board_status": tool_board_status,
+    "mcp_list": tool_mcp_list,
+    "mcp_search": tool_mcp_search,
+    "mcp_inspect": tool_mcp_inspect,
+    "mcp_call": tool_mcp_call,
+}
+
+
+async def _dispatch_step(name: str, arguments: dict):
+    fn = _STEP_TOOLS.get(name)
+    if fn is None:
+        raise step_runner.StepRunnerError(
+            f"tool {name!r} is not allowed in run_steps"
+        )
+    value = fn(**arguments)
+    if inspect.isawaitable(value):
+        value = await value
+    return value
+
+
+async def tool_run_steps(steps: list[dict], stop_on_error: bool = True, step_timeout: float = 30.0) -> dict:
+    """Execute up to 20 explicit tool steps sequentially and return once at the end."""
+    try:
+        return await step_runner.run_steps(
+            steps,
+            _dispatch_step,
+            stop_on_error=stop_on_error,
+            step_timeout=step_timeout,
+        )
+    except step_runner.StepRunnerError as exc:
+        return {"error": str(exc), "executed_steps": 0}
+
 
 def _build_mcp_app():
-    """Build the FastMCP server and return its Starlette app (with auth)."""
     from mcp.server.fastmcp import FastMCP
     from mcp.server.transport_security import TransportSecuritySettings
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
-
     from . import oauth
 
     global _transport_security
-    # Keep DNS rebinding protection enabled. localhost stays allowed; the
-    # trusted public tunnel host is added once known (see _apply_public_url /
-    # _watch_public_url). Passing settings explicitly also keeps the exact
-    # same localhost defaults the SDK would auto-apply for host=127.0.0.1.
     _transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=list(_LOCALHOST_HOSTS),
         allowed_origins=list(_LOCALHOST_ORIGINS),
     )
-
-    mcp = FastMCP(
-        "termux-mcp",
-        json_response=True,
-        transport_security=_transport_security,
-    )
-
-    # FastMCP copies the settings into its own Settings object and the
-    # session manager reads that copy, so keep the module reference on the
-    # copy for runtime updates (see _apply_public_url / _watch_public_url).
+    mcp = FastMCP("termux-mcp", json_response=True, transport_security=_transport_security)
     _transport_security = mcp.settings.transport_security
-    # Seed with any already-known public URL (configured TERMUX_MCP_PUBLIC_URL
-    # or a runtime URL written before the server started). Tunnel URLs that
-    # arrive later are picked up by the watcher thread in start_mcp_server().
     _apply_public_url(_transport_security, config.get_public_url())
 
-    # Explicit names: the module-level functions keep their `tool_` prefix
-    # so tests can call them directly, but the MCP protocol exposes the
-    # curated names required by the task spec.
     mcp.tool(name="run_command")(tool_run_command)
     mcp.tool(name="read_file")(tool_read_file)
     mcp.tool(name="write_file")(tool_write_file)
@@ -365,16 +322,13 @@ def _build_mcp_app():
     mcp.tool(name="board_status")(tool_board_status)
     mcp.tool(name="mcp_install")(tool_mcp_install)
     mcp.tool(name="mcp_list")(tool_mcp_list)
+    mcp.tool(name="mcp_search")(tool_mcp_search)
     mcp.tool(name="mcp_inspect")(tool_mcp_inspect)
     mcp.tool(name="mcp_call")(tool_mcp_call)
     mcp.tool(name="mcp_remove")(tool_mcp_remove)
+    mcp.tool(name="run_steps")(tool_run_steps)
 
     app = mcp.streamable_http_app()
-
-    # OAuth: authorization-server + protected-resource metadata routes.
-    # These are public (no Bearer required) so MCP clients can discover
-    # and complete the OAuth flow. When OAuth is disabled nothing is
-    # advertised and the static Bearer behavior is unchanged.
     if oauth.oauth_enabled():
         for route in oauth.build_auth_routes():
             app.router.routes.append(route)
@@ -390,41 +344,26 @@ def _build_mcp_app():
                 result = await auth.authenticate_async(dict(request.headers))
                 if result.authorized:
                     return await call_next(request)
-                return JSONResponse(
-                    {"error": "Unauthorized"},
-                    status_code=401,
-                    headers=auth.challenge_headers(),
-                )
-
+                return JSONResponse({"error": "Unauthorized"}, status_code=401,
+                                    headers=auth.challenge_headers())
         app.add_middleware(_AuthMiddleware)
-
     return app
 
 
 def start_mcp_server():
-    """Start the MCP Streamable HTTP server in a background thread.
-
-    Returns the uvicorn Server instance (for tests) or None on failure.
-    """
     try:
         import uvicorn
     except ImportError:
         logger.warning("uvicorn not installed — MCP layer disabled")
         return None
-
     try:
         app = _build_mcp_app()
-    except Exception as e:  # pragma: no cover - defensive
-        logger.warning("Failed to build MCP app: %s", e)
+    except Exception as exc:
+        logger.warning("Failed to build MCP app: %s", exc)
         return None
-
-    # The CLI may start the tunnel after this server is already up; the
-    # watcher keeps DNS-rebinding allowed_hosts in sync with the runtime
-    # public URL so the verified tunnel host is accepted.
     _start_transport_security_watcher()
-
-    config = uvicorn.Config(app, host=MCP_HOST, port=MCP_PORT, log_level="warning")
-    server = uvicorn.Server(config)
+    uvicorn_config = uvicorn.Config(app, host=MCP_HOST, port=MCP_PORT, log_level="warning")
+    server = uvicorn.Server(uvicorn_config)
     thread = threading.Thread(target=server.run, daemon=True, name="mcp-uvicorn")
     thread.start()
     logger.info("MCP Streamable HTTP endpoint on http://%s:%d/mcp", MCP_HOST, MCP_PORT)
