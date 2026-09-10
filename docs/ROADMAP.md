@@ -1,7 +1,8 @@
 # Development roadmap
 
 This roadmap prioritizes the gap between “the server works” and “a new user can
-reliably operate it.” Checked items describe the current `main` baseline.
+reliably operate it.” Checked items describe the current `main` baseline plus
+local work that is ready for review.
 
 ## 0.9 — current foundation
 
@@ -36,7 +37,8 @@ reliably operate it.” Checked items describe the current `main` baseline.
 
 - [ ] generate client-specific connection snippets without printing secrets
 - [ ] add a local pairing page or QR handoff for the public MCP URL
-- [ ] report tunnel URL changes and OAuth reauthorization requirements clearly
+- [x] add safe base-domain migration planning, backups, ingress validation, local URL rewrites, and public route health checks
+- [ ] make domain migration update/re-authorize every supported OAuth client automatically where the provider permits it
 - [ ] add optional Termux:Boot integration
 - [ ] add battery-optimization and background-process diagnostics
 

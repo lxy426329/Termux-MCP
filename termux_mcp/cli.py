@@ -126,6 +126,23 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--no-dns", action="store_true",
         help="Update ingress only; do not create the Cloudflare DNS route",
     )
+    p_domain_plan = domain_sub.add_parser(
+        "plan", help="Preview moving all ingress hosts to a new base domain"
+    )
+    p_domain_plan.add_argument("new_domain")
+    p_domain_plan.add_argument("--from-domain", default=None)
+    p_domain_plan.add_argument("--config", default=None)
+    p_domain_migrate = domain_sub.add_parser(
+        "migrate", help="Move ingress hosts to a new base domain safely"
+    )
+    p_domain_migrate.add_argument("new_domain")
+    p_domain_migrate.add_argument("--from-domain", default=None)
+    p_domain_migrate.add_argument("--tunnel", required=True)
+    p_domain_migrate.add_argument("--config", default=None)
+    p_domain_migrate.add_argument(
+        "--no-dns", action="store_true",
+        help="Rewrite and validate ingress only; do not create new DNS routes",
+    )
 
     return parser.parse_args(argv)
 
@@ -375,6 +392,31 @@ def cmd_domain(args: argparse.Namespace) -> int:
                 print("No hostname ingress routes configured.")
             for rule in rules:
                 print(f"{rule.hostname} -> {rule.service}")
+            return 0
+
+        if args.domain_command == "plan":
+            planned = named_tunnel.plan_domain_migration(
+                args.new_domain, path=path, from_domain=args.from_domain
+            )
+            print("Domain migration preview (no changes made):")
+            for old, new in planned:
+                print(f"  {old.hostname} -> {new.hostname}  [{old.service}]")
+            return 0
+
+        if args.domain_command == "migrate":
+            backup, planned = named_tunnel.migrate_ingress_domain(
+                args.new_domain, path=path, from_domain=args.from_domain
+            )
+            if backup:
+                print(f"Ingress hostnames migrated and validated. Backup: {backup}")
+            else:
+                print("Ingress hostnames already match the requested domain.")
+            if not args.no_dns:
+                for _, new in planned:
+                    named_tunnel.route_dns(args.tunnel, new.hostname)
+                    print(f"DNS route ready: {new.hostname}")
+            print("Restart the named cloudflared tunnel to load the new ingress.")
+            print("Review OAuth/public URL environment variables before switching clients.")
             return 0
 
         backup = named_tunnel.add_ingress(args.hostname, args.port, path=path)

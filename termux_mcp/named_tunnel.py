@@ -51,6 +51,133 @@ def list_ingress(path: str = DEFAULT_CONFIG) -> List[IngressRule]:
     return rules
 
 
+
+def _base_domain(value: str) -> str:
+    """Validate a base domain used for bulk hostname migration.
+
+    This intentionally accepts ordinary DNS names only. It does not try to
+    consult the public suffix list; callers explicitly choose the domain they
+    own (for example ``example.com``).
+    """
+    return _hostname(value)
+
+
+def plan_domain_migration(
+    new_domain: str,
+    *,
+    path: str = DEFAULT_CONFIG,
+    from_domain: str | None = None,
+) -> List[tuple[IngressRule, IngressRule]]:
+    """Return old/new ingress pairs without changing any files.
+
+    ``from_domain`` is optional when every configured hostname shares one
+    obvious suffix. For mixed-domain configurations, require it explicitly so
+    a migration cannot accidentally rewrite unrelated routes.
+    """
+    new_base = _base_domain(new_domain)
+    rules = list_ingress(path)
+    if not rules:
+        return []
+
+    if from_domain:
+        old_base = _base_domain(from_domain)
+    else:
+        labels = [rule.hostname.lower().rstrip('.').split('.') for rule in rules]
+        common: list[str] = []
+        for parts in zip(*(reversed(x) for x in labels)):
+            if len(set(parts)) != 1:
+                break
+            common.append(parts[0])
+        if len(common) < 2:
+            raise ValueError(
+                "could not infer one source domain from mixed ingress routes; "
+                "pass --from-domain"
+            )
+        old_base = '.'.join(reversed(common))
+
+    planned: List[tuple[IngressRule, IngressRule]] = []
+    for rule in rules:
+        host = rule.hostname.lower().rstrip('.')
+        if host == old_base:
+            prefix = ''
+        elif host.endswith('.' + old_base):
+            prefix = host[: -(len(old_base) + 1)]
+        else:
+            continue
+        new_host = new_base if not prefix else f"{prefix}.{new_base}"
+        planned.append((rule, IngressRule(new_host, rule.service)))
+
+    if not planned:
+        raise ValueError(f"no ingress routes belong to {old_base}")
+    return planned
+
+
+def migrate_ingress_domain(
+    new_domain: str,
+    *,
+    path: str = DEFAULT_CONFIG,
+    from_domain: str | None = None,
+    validate: bool = True,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> tuple[str, List[tuple[IngressRule, IngressRule]]]:
+    """Atomically rewrite ingress hostnames to a new base domain.
+
+    The Cloudflare config is backed up before replacement and restored if
+    ``cloudflared tunnel ingress validate`` rejects the result. DNS routing is
+    deliberately separate; callers can preview first and create DNS records
+    only after the config is known-good.
+    """
+    target = Path(path)
+    original = target.read_text(encoding="utf-8")
+    planned = plan_domain_migration(
+        new_domain, path=path, from_domain=from_domain
+    )
+    updated = original
+    for old, new in planned:
+        pattern = re.compile(
+            r"(^\s*-\s*hostname:\s*)" + re.escape(old.hostname) + r"(\s*$)",
+            re.MULTILINE,
+        )
+        updated, count = pattern.subn(
+            lambda match: match.group(1) + new.hostname + match.group(2),
+            updated,
+            count=1,
+        )
+        if count != 1:
+            raise RuntimeError(f"could not rewrite ingress hostname: {old.hostname}")
+
+    if updated == original:
+        return "", planned
+
+    backup = str(target) + ".before-domain-" + time.strftime("%Y%m%d-%H%M%S")
+    fd, temp_name = tempfile.mkstemp(prefix=target.name + ".", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(updated)
+        os.chmod(temp_name, 0o600)
+        shutil.copy2(target, backup)
+        os.replace(temp_name, target)
+        if validate:
+            result = runner(
+                ["cloudflared", "tunnel", "ingress", "validate"],
+                text=True,
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+            if result.returncode != 0:
+                shutil.copy2(backup, target)
+                detail = (result.stderr or result.stdout).strip()
+                raise RuntimeError(
+                    f"invalid Cloudflare ingress; restored backup: {detail}"
+                )
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+    return backup, planned
+
 def add_ingress(
     hostname: str,
     port: int,
