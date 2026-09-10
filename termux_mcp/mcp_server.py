@@ -11,6 +11,7 @@ from . import managed_mcp
 from . import operations
 from . import permissions
 from . import step_runner
+from . import task_log
 from . import walnut_board
 from . import walnut_inbox
 from .auth import get_auth_provider
@@ -242,6 +243,23 @@ def tool_mcp_remove(name: str) -> dict:
         return {"error": str(exc), "server": name}
 
 
+def tool_task_list(limit: int = 20) -> dict:
+    """List recent locally persisted run_steps tasks without full logs."""
+    try:
+        return task_log.list_recent(limit)
+    except task_log.TaskLogError as exc:
+        return {"error": str(exc)}
+
+
+def tool_task_get(task_id: str, step: int = 0, output_mode: str = "normal") -> dict:
+    """Fetch a stored workflow or a single step on demand."""
+    try:
+        data = task_log.get(task_id, step)
+        return step_runner.render_payload(data, output_mode)
+    except (task_log.TaskLogError, step_runner.StepRunnerError) as exc:
+        return {"error": str(exc), "task_id": task_id}
+
+
 _STEP_TOOLS = {
     "run_command": tool_run_command,
     "read_file": tool_read_file,
@@ -286,14 +304,13 @@ async def tool_run_steps(
     stop_on_error: bool = True,
     step_timeout: float = 30.0,
     output_mode: str = "compact",
+    persist_log: bool = True,
 ) -> dict:
     """Execute up to 20 explicit steps and return once at the end.
 
-    output_mode controls context cost: compact (default) trims large
-    intermediate payloads, normal keeps more detail, and full is intended for
-    debugging. A step may include a safe declarative `when` condition that
-    references an earlier step, for example:
-    {"when": {"step": 1, "path": "result.exit_code", "equals": 0}}.
+    output_mode controls chat context cost. With persist_log enabled (default),
+    the complete untrimmed workflow result stays on the Termux device and the
+    response includes a task_id for later task_get inspection.
     """
     try:
         return await step_runner.run_steps(
@@ -302,6 +319,7 @@ async def tool_run_steps(
             stop_on_error=stop_on_error,
             step_timeout=step_timeout,
             output_mode=output_mode,
+            persist_log=persist_log,
         )
     except step_runner.StepRunnerError as exc:
         return {"error": str(exc), "executed_steps": 0}
@@ -350,6 +368,8 @@ def _build_mcp_app():
     mcp.tool(name="mcp_call")(tool_mcp_call)
     mcp.tool(name="mcp_remove")(tool_mcp_remove)
     mcp.tool(name="run_steps")(tool_run_steps)
+    mcp.tool(name="task_list")(tool_task_list)
+    mcp.tool(name="task_get")(tool_task_get)
 
     app = mcp.streamable_http_app()
     if oauth.oauth_enabled():
