@@ -216,6 +216,14 @@ async def tool_mcp_inspect(name: str) -> dict:
         return {"error": str(exc), "server": name}
 
 
+async def tool_mcp_health(name: str = "") -> dict:
+    """Check one or all managed MCP servers without invoking their tools."""
+    try:
+        return await managed_mcp.health(name)
+    except Exception as exc:
+        return {"error": str(exc), "server": name or None, "health": "offline"}
+
+
 async def tool_mcp_call(name: str, tool: str, arguments: dict = None) -> dict:
     if not permissions.allows("managed.call"):
         return permissions.denied("managed.call")
@@ -256,6 +264,7 @@ _STEP_TOOLS = {
     "mcp_list": tool_mcp_list,
     "mcp_search": tool_mcp_search,
     "mcp_inspect": tool_mcp_inspect,
+    "mcp_health": tool_mcp_health,
     "mcp_call": tool_mcp_call,
 }
 
@@ -337,6 +346,7 @@ def _build_mcp_app():
     mcp.tool(name="mcp_list")(tool_mcp_list)
     mcp.tool(name="mcp_search")(tool_mcp_search)
     mcp.tool(name="mcp_inspect")(tool_mcp_inspect)
+    mcp.tool(name="mcp_health")(tool_mcp_health)
     mcp.tool(name="mcp_call")(tool_mcp_call)
     mcp.tool(name="mcp_remove")(tool_mcp_remove)
     mcp.tool(name="run_steps")(tool_run_steps)
