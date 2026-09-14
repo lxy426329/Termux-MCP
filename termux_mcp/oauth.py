@@ -3,7 +3,7 @@
 OAuth is optional and disabled unless TERMUX_MCP_OAUTH_ISSUER is configured.
 The self-hosted authorization server implements authorization-code + PKCE via
 the official MCP SDK abstractions. Because this lightweight server currently
-has no interactive owner-consent UI, issuing authorization codes is denied by
+has no interactive owner-consent UI, the public /authorize route is denied by
 default. Owners who intentionally accept automatic approval must explicitly set
 TERMUX_MCP_OAUTH_AUTO_APPROVE=1.
 
@@ -37,7 +37,6 @@ def oauth_enabled() -> bool:
 
 
 def auto_approve_enabled() -> bool:
-    """Whether the owner explicitly opted into non-interactive OAuth approval."""
     return bool(config.OAUTH_AUTO_APPROVE)
 
 
@@ -185,19 +184,12 @@ class InMemoryAuthProvider:
             self._save_state()
 
     async def authorize(self, client, params) -> str:
-        """Issue a short-lived code only after explicit owner opt-in.
+        """Generate a short-lived, one-time authorization code.
 
-        This project does not yet ship a local interactive consent UI. Denying
-        by default prevents a public /register + /authorize pair from silently
-        becoming an automatic token minting endpoint.
+        Public access to this method is guarded by build_auth_routes(); keeping
+        the provider protocol itself side-effect compatible also makes it easy
+        to test token semantics independently of the HTTP consent boundary.
         """
-        if not auto_approve_enabled():
-            raise PermissionError(
-                "OAuth authorization requires device-owner approval. "
-                "Interactive consent is not implemented yet; explicitly set "
-                "TERMUX_MCP_OAUTH_AUTO_APPROVE=1 only if you accept automatic "
-                "approval for registered clients."
-            )
         from mcp.server.auth.provider import AuthorizationCode, construct_redirect_uri
 
         code = secrets.token_urlsafe(32)
@@ -379,7 +371,6 @@ class _DynamicProtectedResourceHandler:
 
 
 def build_auth_routes():
-    """Build OAuth authorization-server + metadata routes from SDK handlers."""
     from mcp.server.auth.handlers.authorize import AuthorizationHandler
     from mcp.server.auth.handlers.register import RegistrationHandler
     from mcp.server.auth.handlers.revoke import RevocationHandler
@@ -410,7 +401,11 @@ def build_auth_routes():
         return await authorize_handler.handle(request)
 
     return [
-        Route("/.well-known/oauth-authorization-server", metadata_handler.handle, methods=["GET"]),
+        Route(
+            "/.well-known/oauth-authorization-server",
+            metadata_handler.handle,
+            methods=["GET"],
+        ),
         Route("/authorize", guarded_authorize, methods=["GET", "POST"]),
         Route("/token", token_handler.handle, methods=["POST"]),
         Route("/register", register_handler.handle, methods=["POST"]),
@@ -423,6 +418,14 @@ def build_protected_resource_routes():
 
     handler = _DynamicProtectedResourceHandler()
     return [
-        Route("/.well-known/oauth-protected-resource", handler.handle, methods=["GET"]),
-        Route("/.well-known/oauth-protected-resource/mcp", handler.handle, methods=["GET"]),
+        Route(
+            "/.well-known/oauth-protected-resource",
+            handler.handle,
+            methods=["GET"],
+        ),
+        Route(
+            "/.well-known/oauth-protected-resource/mcp",
+            handler.handle,
+            methods=["GET"],
+        ),
     ]
