@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
 """Live-server smoke test for termux-mcp (REST + MCP Streamable HTTP).
 
-Starts the real server (REST + MCP) on free loopback ports, then validates:
-
-  1. REST GET /ping works without auth.
-  2. REST protected endpoint (GET /env) rejects a missing Bearer token.
-  3. MCP POST /mcp rejects a missing Bearer token.
-  4. Authenticated MCP initialize -> tools/list -> tools/call succeeds.
-
-This requires a live server, so it is intentionally separate from the
-pytest unit tests. Run it on the device or a Linux host:
-
-    python scripts/mcp_smoke.py
-
-Exit code 0 = all checks passed.
+Starts the real server on free loopback ports and validates REST auth plus a
+real authenticated MCP initialize -> tools/list -> tools/call round trip.
 """
 
 import asyncio
@@ -28,7 +17,7 @@ import urllib.request
 
 TOKEN = os.environ.get("TERMUX_MCP_AUTH_TOKEN", "smoke-test-token-0123456789")
 
-EXPECTED_TOOLS = [
+CORE_TOOLS = {
     "run_command",
     "read_file",
     "write_file",
@@ -37,7 +26,8 @@ EXPECTED_TOOLS = [
     "get_location",
     "get_battery",
     "send_notification",
-]
+    "permissions_status",
+}
 
 FAILURES = []
 
@@ -90,11 +80,16 @@ async def mcp_flow(mcp_url):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools = await session.list_tools()
-            names = [t.name for t in tools.tools]
+            names = {t.name for t in tools.tools}
             check(
-                "MCP tools/list exposes exactly the 8 curated tools",
-                names == EXPECTED_TOOLS,
-                f"got {names}",
+                "MCP tools/list contains the public core surface",
+                CORE_TOOLS.issubset(names),
+                f"missing {sorted(CORE_TOOLS - names)}",
+            )
+            check(
+                "Walnut private tools are absent from public main",
+                not any(n.startswith(("inbox_", "board_")) for n in names),
+                f"got {sorted(names)}",
             )
             res = await session.call_tool("run_command", {"cmd": "echo smoke-ok"})
             text = res.content[0].text
@@ -102,8 +97,10 @@ async def mcp_flow(mcp_url):
                 "MCP tools/call run_command returns structured JSON",
                 all(
                     f'"{k}"' in text
-                    for k in ("stdout", "stderr", "exit_code", "truncated",
-                              "risk_level", "snapshots")
+                    for k in (
+                        "stdout", "stderr", "exit_code", "truncated",
+                        "risk_level", "snapshots",
+                    )
                 )
                 and "smoke-ok" in text,
                 text[:120],
@@ -122,6 +119,7 @@ def main():
     env["TERMUX_MCP_PORT"] = str(rest_port)
     env["TERMUX_MCP_MCP_HOST"] = "127.0.0.1"
     env["TERMUX_MCP_MCP_PORT"] = str(mcp_port)
+    env["TERMUX_MCP_OAUTH_ISSUER"] = ""
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     proc = subprocess.Popen(
@@ -136,19 +134,15 @@ def main():
             print("FAIL: REST server did not come up")
             return 1
 
-        # 1. REST /ping works without auth.
         status, body = http_request(f"{rest_url}/ping")
         check("REST GET /ping returns 200 without auth", status == 200, body[:80])
 
-        # 2. REST protected endpoint rejects missing Bearer.
         status, _ = http_request(f"{rest_url}/env")
         check("REST GET /env rejects missing Bearer token", status == 401)
 
-        # 3. MCP /mcp rejects missing Bearer.
         status, _ = http_request(mcp_url, method="POST", body={})
         check("MCP POST /mcp rejects missing Bearer token", status == 401)
 
-        # 4. Authenticated MCP flow.
         asyncio.run(mcp_flow(mcp_url))
     finally:
         proc.terminate()
