@@ -70,6 +70,20 @@ def wait_for(url, timeout=15):
     return False
 
 
+def wait_for_mcp(url, timeout=15):
+    """Wait until the MCP listener answers HTTP, even if the answer is 401."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            status, _ = http_request(url, method="POST", body={})
+            if status in (200, 400, 401, 405):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
+
+
 async def mcp_flow(mcp_url):
     from mcp.client.session import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
@@ -132,6 +146,9 @@ def main():
     try:
         if not wait_for(f"{rest_url}/ping"):
             print("FAIL: REST server did not come up")
+            return 1
+        if not wait_for_mcp(mcp_url):
+            print("FAIL: MCP server did not come up")
             return 1
 
         status, body = http_request(f"{rest_url}/ping")
