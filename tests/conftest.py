@@ -1,12 +1,30 @@
-"""Shared pytest configuration.
+"""Shared pytest fixtures and environment setup.
 
-OAuth integration tests exercise the legacy automatic-approval flow explicitly;
-production defaults remain safe (TERMUX_MCP_OAUTH_AUTO_APPROVE=0). Tests that
-need to verify the safe default override config.OAUTH_AUTO_APPROVE themselves.
+Environment variables MUST be set before termux_mcp is imported — config.py
+reads them at import time. HOME is redirected to a temp dir so snapshot /
+trash behavior never touches the real user home.
 """
 
 import os
+import sys
+import tempfile
 
-# Set before termux_mcp.config is imported by test modules.
-os.environ.setdefault("TERMUX_MCP_AUTH_TOKEN", "test-token-0123456789abcdef")
-os.environ.setdefault("TERMUX_MCP_OAUTH_AUTO_APPROVE", "1")
+_TMP = tempfile.mkdtemp(prefix="termux-mcp-test-")
+os.environ["HOME"] = _TMP
+os.environ["TERMUX_MCP_AUTH_TOKEN"] = "test-token-0123456789abcdef"
+os.environ["TERMUX_MCP_MCP_PORT"] = "18765"
+os.environ["TERMUX_MCP_WORKSPACE"] = ""
+# OAuth integration tests explicitly exercise the auto-approval compatibility
+# flow. Production defaults remain safe (TERMUX_MCP_OAUTH_AUTO_APPROVE=0).
+os.environ["TERMUX_MCP_OAUTH_AUTO_APPROVE"] = "1"
+# Loopback integration tests must never use a developer or CI machine's
+# outbound proxy.
+for _proxy_name in (
+    "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy",
+    "HTTPS_PROXY", "https_proxy",
+):
+    os.environ.pop(_proxy_name, None)
+os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+os.environ["no_proxy"] = "127.0.0.1,localhost"
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
