@@ -13,13 +13,14 @@ Commands:
   termux-mcp permissions              Show or change the AI permission mode.
 
 `start` is the one-command experience: it ensures an auth token exists,
-starts the server, waits for REST + MCP health, starts the selected tunnel,
-verifies the public URL, and prints the final MCP URL.
+starts the server, verifies both REST availability and a real MCP protocol
+handshake, starts the selected tunnel, verifies the public URL, and prints the
+final MCP URL.
 
 `restart` is server-only by default: the running tunnel, its PID and the
-verified public URL are preserved so ChatGPT's saved MCP URL stays valid
-even though anonymous tunnel hostnames change between tunnel rebuilds.
-Pass --tunnel <mode> to rebuild the tunnel, or --no-tunnel to stop it.
+verified public URL are preserved so a saved MCP URL stays valid even though
+anonymous tunnel hostnames change between tunnel rebuilds. Pass --tunnel <mode>
+to rebuild the tunnel, or --no-tunnel to stop it.
 """
 
 import argparse
@@ -147,14 +148,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-# ── Commands ─────────────────────────────────────────────────────────────────
-
 def cmd_start(args: argparse.Namespace) -> int:
-    # A. Load config / ensure token.
     token = ensure_token()
     print(f"Auth token: configured (length {len(token)})")
 
-    # B. Avoid duplicate instances.
     if process.is_running():
         print(
             f"termux-mcp is already running (pid {process.read_pid()}). "
@@ -162,21 +159,22 @@ def cmd_start(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # C. Start the server.
     pid = process.start_server()
     print(f"Server started (pid {pid})")
 
-    # D. Wait for REST + MCP health.
     rest_ok = process.wait_http(PORT)
-    mcp_ok = process.wait_http(MCP_PORT) if MCP_ENABLED else True
+    mcp_ok = process.wait_mcp(MCP_PORT, token) if MCP_ENABLED else True
     print(f"REST http://127.0.0.1:{PORT}: {'OK' if rest_ok else 'NOT RESPONDING'}")
     if MCP_ENABLED:
-        print(f"MCP  http://127.0.0.1:{MCP_PORT}/mcp: {'OK' if mcp_ok else 'NOT RESPONDING'}")
-    if not rest_ok:
+        print(
+            f"MCP  http://127.0.0.1:{MCP_PORT}/mcp: "
+            f"{'OK' if mcp_ok else 'PROTOCOL CHECK FAILED'}"
+        )
+    if not rest_ok or not mcp_ok:
         print("Server did not become healthy. Check 'termux-mcp logs'.")
+        process.stop_server()
         return 1
 
-    # E/F/G/H. Tunnel.
     choice = "none" if args.no_tunnel else args.tunnel
     if choice != "none":
         result = tunnel_mod.start_tunnel(MCP_PORT, choice)
@@ -185,8 +183,6 @@ def cmd_start(args: argparse.Namespace) -> int:
             print(f"Tunnel ({result.provider}): {mcp_url}")
             if result.process and result.process.pid:
                 process.write_tunnel_pid(result.process.pid)
-            # Propagate the real public URL so OAuth metadata / challenges
-            # served by the server process use it (never Host headers).
             set_public_url(result.url)
             if tunnel_mod.verify_url(result.url):
                 print("Public endpoint: reachable")
@@ -196,7 +192,6 @@ def cmd_start(args: argparse.Namespace) -> int:
             print(f"Tunnel failed: {result.error}")
             print("The server is still running locally — use 'termux-mcp start --no-tunnel'.")
 
-    # I. Next steps.
     print("\nNext steps:")
     print(f"  REST API:   http://127.0.0.1:{PORT}")
     print(f"  MCP local:  http://127.0.0.1:{MCP_PORT}/mcp")
@@ -215,7 +210,6 @@ def cmd_stop() -> int:
         process.clear_tunnel_pid()
         print(f"Tunnel stopped (pid {pid})")
     else:
-        # Clean up a stale tunnel.pid if present.
         process.clear_tunnel_pid()
     clear_public_url()
     if process.is_running():
@@ -229,14 +223,6 @@ def cmd_stop() -> int:
 
 
 def _restart_tunnel_action(args: argparse.Namespace) -> str:
-    """Decide how restart handles the tunnel: keep | rebuild | stop.
-
-    Default is "keep" (server-only restart): the running tunnel and its
-    verified public URL are preserved so ChatGPT's saved MCP URL stays
-    valid. Explicit --tunnel <mode> rebuilds the tunnel; --no-tunnel
-    stops it. `restart --tunnel auto` keeps the old "stop everything and
-    rebuild" behavior.
-    """
     if args.no_tunnel:
         return "stop"
     if args.tunnel is not None:
@@ -247,7 +233,6 @@ def _restart_tunnel_action(args: argparse.Namespace) -> str:
 def cmd_restart(args: argparse.Namespace) -> int:
     action = _restart_tunnel_action(args)
 
-    # 1. Stop the server only — never touch the tunnel unless asked.
     if process.is_running():
         pid = process.read_pid()
         process.stop_server()
@@ -256,7 +241,6 @@ def cmd_restart(args: argparse.Namespace) -> int:
         process.clear_pid()
         print("Server is not running.")
 
-    # 2. Tunnel handling per the requested action.
     if action in ("rebuild", "stop"):
         if process.tunnel_is_running():
             tpid = process.read_tunnel_pid()
@@ -265,27 +249,19 @@ def cmd_restart(args: argparse.Namespace) -> int:
             print(f"Tunnel stopped (pid {tpid})")
         else:
             process.clear_tunnel_pid()
-        # The old public URL is no longer valid once the tunnel is gone.
         clear_public_url()
-    else:  # keep
+    else:
         if process.tunnel_is_running():
             print(f"Tunnel kept (pid {process.read_tunnel_pid()})")
             pub = get_public_url()
             if pub:
                 print(f"Public MCP URL kept: {pub}/mcp")
         else:
-            # No live tunnel — drop any stale public URL so the restarted
-            # server does not advertise a dead endpoint.
             clear_public_url()
             print("No running tunnel to keep.")
 
-    # Small pause so the ports are released before rebinding.
     time.sleep(1)
 
-    # 3. Start the server. Rebuild passes the requested provider; keep/stop
-    # start without touching the tunnel (a kept tunnel still forwards to the
-    # same MCP port, and the persisted public_url is re-read by the server's
-    # transport-security watcher on startup).
     start_args = argparse.Namespace()
     if action == "rebuild":
         start_args.no_tunnel = False
@@ -302,7 +278,12 @@ def cmd_status() -> int:
     print(f"Server: {'RUNNING' if running else 'STOPPED'}" + (f" (pid {pid})" if pid else ""))
     print(f"REST http://127.0.0.1:{PORT}: {'OK' if process.port_open(PORT) else 'DOWN'}")
     if MCP_ENABLED:
-        print(f"MCP  http://127.0.0.1:{MCP_PORT}/mcp: {'OK' if process.port_open(MCP_PORT) else 'DOWN'}")
+        if process.port_open(MCP_PORT):
+            mcp_ok = process.mcp_healthy(MCP_PORT, AUTH_TOKEN) if AUTH_TOKEN else False
+            mcp_status = "OK" if mcp_ok else "PORT OPEN / PROTOCOL FAIL"
+        else:
+            mcp_status = "DOWN"
+        print(f"MCP  http://127.0.0.1:{MCP_PORT}/mcp: {mcp_status}")
     print(f"Auth: {'enabled' if token_configured() else 'DISABLED'}")
     from . import config
     print(f"Client: {config.CLIENT_TARGET}")
@@ -311,12 +292,15 @@ def cmd_status() -> int:
         print(f"Workspace: {WORKSPACE_ROOT}")
     if process.tunnel_is_running():
         print(f"Tunnel: running (pid {process.read_tunnel_pid()})")
-    # OAuth / discovery state — never print tokens or client secrets.
     from . import oauth
     if oauth.oauth_enabled():
         print("OAuth resource metadata: enabled")
         issuer = oauth.get_issuer()
         print(f"OAuth issuer: {issuer or 'not resolvable (auto + no public URL)'}")
+        print(
+            "OAuth auto approval: "
+            + ("ENABLED" if oauth.auto_approve_enabled() else "disabled (safe default)")
+        )
     else:
         print("OAuth resource metadata: disabled (static Bearer mode)")
     pub = get_public_url()
@@ -379,8 +363,6 @@ def cmd_permissions(args: argparse.Namespace) -> int:
     return 0
 
 
-# ── Named domains ────────────────────────────────────────────────────────────
-
 def cmd_domain(args: argparse.Namespace) -> int:
     from . import named_tunnel
 
@@ -434,8 +416,6 @@ def cmd_domain(args: argparse.Namespace) -> int:
         return 1
 
 
-# ── doctor ───────────────────────────────────────────────────────────────────
-
 def _pkg_version(name: str) -> Optional[str]:
     try:
         from importlib.metadata import version
@@ -477,117 +457,138 @@ def cmd_doctor(json_output: bool = False) -> int:
     if emit:
         print(f"termux-mcp doctor (v{__version__})\n")
 
-    # OS / Termux
     is_termux = os.environ.get("PREFIX", "").startswith("/data/data/com.termux")
-    _check(checks, "termux_environment", "Termux environment", is_termux,
-           "PREFIX detected" if is_termux else "not Termux (running on desktop?)",
-           warn=not is_termux, emit=emit)
+    _check(
+        checks, "termux_environment", "Termux environment", is_termux,
+        "PREFIX detected" if is_termux else "not Termux (running on desktop?)",
+        warn=not is_termux, emit=emit,
+    )
 
-    # Python
     py = sys.version.split()[0]
-    _check(checks, "python_version", "Python version", sys.version_info >= (3, 10), py,
-           emit=emit)
+    _check(
+        checks, "python_version", "Python version", sys.version_info >= (3, 10), py,
+        emit=emit,
+    )
 
-    # Package / deps
     pkg = _pkg_version("termux-mcp")
-    _check(checks, "package_installed", "termux-mcp installed", pkg is not None,
-           pkg or "not installed via pip (running from source is fine)", warn=pkg is None,
-           emit=emit)
+    _check(
+        checks, "package_installed", "termux-mcp installed", pkg is not None,
+        pkg or "not installed via pip (running from source is fine)", warn=pkg is None,
+        emit=emit,
+    )
     mcp_ver = _pkg_version("mcp")
-    _check(checks, "mcp_sdk_version", "MCP SDK (mcp>=1.28,<2)",
-           _version_in_range(mcp_ver, "1.28", "2"), mcp_ver or "not installed",
-           emit=emit)
+    _check(
+        checks, "mcp_sdk_version", "MCP SDK (mcp>=1.28,<2)",
+        _version_in_range(mcp_ver, "1.28", "2"), mcp_ver or "not installed",
+        emit=emit,
+    )
     uvi = _pkg_version("uvicorn")
-    _check(checks, "uvicorn", "uvicorn", uvi is not None, uvi or "not installed",
-           emit=emit)
+    _check(
+        checks, "uvicorn", "uvicorn", uvi is not None, uvi or "not installed",
+        emit=emit,
+    )
 
-    # Auth
     auth_ok = token_configured()
-    _check(checks, "auth_token", "Auth token configured", auth_ok,
-           "enabled" if auth_ok else "not configured — start will generate one",
-           warn=not auth_ok, emit=emit)
+    _check(
+        checks, "auth_token", "Auth token configured", auth_ok,
+        "enabled" if auth_ok else "not configured — start will generate one",
+        warn=not auth_ok, emit=emit,
+    )
 
-    # OAuth / discovery (no secrets printed; absence is not a FAIL when
-    # static Bearer mode is intentionally used).
     from . import oauth
     if oauth.oauth_enabled():
         issuer = oauth.get_issuer()
-        _check(checks, "oauth_metadata", "OAuth resource metadata", True, "enabled",
-               emit=emit)
-        _check(checks, "oauth_issuer", "OAuth issuer", bool(issuer),
-               issuer or "auto — no public URL yet", warn=not issuer, emit=emit)
+        _check(
+            checks, "oauth_metadata", "OAuth resource metadata", True, "enabled",
+            emit=emit,
+        )
+        _check(
+            checks, "oauth_issuer", "OAuth issuer", bool(issuer),
+            issuer or "auto — no public URL yet", warn=not issuer, emit=emit,
+        )
+        _check(
+            checks, "oauth_consent", "OAuth approval boundary", True,
+            "auto approval explicitly enabled" if oauth.auto_approve_enabled()
+            else "auto approval disabled; /authorize is denied by default",
+            warn=oauth.auto_approve_enabled(), emit=emit,
+        )
         pub = get_public_url()
-        _check(checks, "public_url", "Public MCP URL", bool(pub),
-               f"{pub}/mcp" if pub else "unavailable", warn=not pub, emit=emit)
+        _check(
+            checks, "public_url", "Public MCP URL", bool(pub),
+            f"{pub}/mcp" if pub else "unavailable", warn=not pub, emit=emit,
+        )
     else:
-        _check(checks, "oauth_metadata", "OAuth resource metadata", True,
-               "disabled (static Bearer mode)", emit=emit)
+        _check(
+            checks, "oauth_metadata", "OAuth resource metadata", True,
+            "disabled (static Bearer mode)", emit=emit,
+        )
 
-    # Workspace
     if WORKSPACE_ROOT:
-        _check(checks, "workspace_root", "Workspace root",
-               os.path.isdir(WORKSPACE_ROOT), WORKSPACE_ROOT, emit=emit)
+        _check(
+            checks, "workspace_root", "Workspace root", os.path.isdir(WORKSPACE_ROOT),
+            WORKSPACE_ROOT, emit=emit,
+        )
     else:
-        _check(checks, "workspace_root", "Workspace root", True,
-               "not set (MCP filesystem tools unrestricted)", warn=True, emit=emit)
+        _check(
+            checks, "workspace_root", "Workspace root", True,
+            "not set (MCP filesystem tools unrestricted)", warn=True, emit=emit,
+        )
 
-    # Closed ports are expected before first start. An occupied port while our
-    # process is stopped is the actionable failure.
     running = process.is_running()
     rest_open = process.port_open(PORT)
     if running:
-        _check(checks, "rest_port", f"REST port {PORT}", rest_open,
-               "listening" if rest_open else "server running but port not listening",
-               emit=emit)
+        _check(
+            checks, "rest_port", f"REST port {PORT}", rest_open,
+            "listening" if rest_open else "server running but port not listening",
+            emit=emit,
+        )
     else:
-        _check(checks, "rest_port", f"REST port {PORT}", not rest_open,
-               "occupied by another process" if rest_open else "not listening; server stopped",
-               warn=not rest_open, emit=emit)
+        _check(
+            checks, "rest_port", f"REST port {PORT}", not rest_open,
+            "occupied by another process" if rest_open else "not listening; server stopped",
+            warn=not rest_open, emit=emit,
+        )
     if MCP_ENABLED:
         mcp_open = process.port_open(MCP_PORT)
         if running:
-            _check(checks, "mcp_port", f"MCP port {MCP_PORT}", mcp_open,
-                   "listening" if mcp_open else "server running but port not listening",
-                   emit=emit)
+            _check(
+                checks, "mcp_port", f"MCP port {MCP_PORT}", mcp_open,
+                "listening" if mcp_open else "server running but port not listening",
+                emit=emit,
+            )
         else:
-            _check(checks, "mcp_port", f"MCP port {MCP_PORT}", not mcp_open,
-                   "occupied by another process" if mcp_open else "not listening; server stopped",
-                   warn=not mcp_open, emit=emit)
+            _check(
+                checks, "mcp_port", f"MCP port {MCP_PORT}", not mcp_open,
+                "occupied by another process" if mcp_open else "not listening; server stopped",
+                warn=not mcp_open, emit=emit,
+            )
 
-    _check(checks, "server_process", "Server process", running,
-           f"pid {process.read_pid()}" if running else "not running", warn=not running,
-           emit=emit)
+    _check(
+        checks, "server_process", "Server process", running,
+        f"pid {process.read_pid()}" if running else "not running", warn=not running,
+        emit=emit,
+    )
 
-    # Tunnel deps
     for name in ("ssh", "cloudflared"):
         import shutil
         found = shutil.which(name) is not None
-        _check(checks, f"tunnel_{name}", f"tunnel dep: {name}", found,
-               shutil.which(name) or "not installed", warn=not found, emit=emit)
+        _check(
+            checks, f"tunnel_{name}", f"tunnel dep: {name}", found,
+            shutil.which(name) or "not installed", warn=not found, emit=emit,
+        )
 
-    # Localhost MCP health (authenticated probe)
-    if MCP_ENABLED and process.port_open(MCP_PORT):
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{MCP_PORT}/mcp",
-                data=b"{}",
-                method="POST",
-                headers={"Content-Type": "application/json"},
-            )
-            try:
-                urllib.request.urlopen(req, timeout=5)
-                _check(checks, "mcp_health", "MCP health", True, "responded",
-                       emit=emit)
-            except urllib.error.HTTPError as e:
-                _check(checks, "mcp_health", "MCP health", e.code == 401,
-                       f"HTTP {e.code}" + (" (auth working)" if e.code == 401 else ""),
-                       emit=emit)
-        except Exception as e:
-            _check(checks, "mcp_health", "MCP health", False, str(e), emit=emit)
+    if MCP_ENABLED and process.port_open(MCP_PORT) and token_configured():
+        healthy = process.mcp_healthy(MCP_PORT, AUTH_TOKEN)
+        _check(
+            checks, "mcp_health", "MCP protocol health", healthy,
+            "initialize + tools/list succeeded" if healthy else "protocol handshake failed",
+            emit=emit,
+        )
     else:
-        _check(checks, "mcp_health", "MCP health", False,
-               "MCP port not listening", warn=True, emit=emit)
+        _check(
+            checks, "mcp_health", "MCP protocol health", False,
+            "MCP port not listening or auth token unavailable", warn=True, emit=emit,
+        )
 
     fails = [c for c in checks if c["status"] == "FAIL"]
     warns = [c for c in checks if c["status"] == "WARN"]
@@ -597,8 +598,12 @@ def cmd_doctor(json_output: bool = False) -> int:
         "fail": len(fails),
     }
     if json_output:
-        print(json.dumps({"version": __version__, "summary": summary, "checks": checks},
-                         ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {"version": __version__, "summary": summary, "checks": checks},
+                ensure_ascii=False, indent=2,
+            )
+        )
         return 1 if fails else 0
 
     print()
@@ -612,13 +617,9 @@ def cmd_doctor(json_output: bool = False) -> int:
     return 0
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
-
 def run(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
     if args.command is None:
-        # Backward compatible: bare `termux-mcp` runs the server in the
-        # foreground (same as `python -m termux_mcp`).
         from .server import run as run_server
         run_server()
         return 0
