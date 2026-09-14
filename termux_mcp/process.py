@@ -10,6 +10,7 @@ The launcher never uses bare `&` backgrounding: every child is tracked by
 PID file, and stop/restart/status operate on those PIDs.
 """
 
+import asyncio
 import os
 import signal
 import subprocess
@@ -18,13 +19,6 @@ import time
 from typing import Optional
 
 from .config import STATE_DIR
-
-# State lives under the profile-aware XDG-style state dir
-# (~/.local/state/termux-mcp[-<profile>]/):
-#   server.pid   — PID of the running `python -m termux_mcp` server
-#   tunnel.pid   — PID of the active tunnel process (if any)
-#   server.log   — captured stdout/stderr of the server
-#   tunnel.log   — captured stdout/stderr of the tunnel process
 
 PID_FILE: str = os.path.join(STATE_DIR, "server.pid")
 TUNNEL_PID_FILE: str = os.path.join(STATE_DIR, "tunnel.pid")
@@ -56,7 +50,6 @@ def _pid_alive(pid: Optional[int]) -> bool:
     if not pid or pid <= 0:
         return False
     if os.name == "nt":
-        # Windows: os.kill(pid, 0) is unsupported — probe via OpenProcess.
         import ctypes
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         handle = ctypes.windll.kernel32.OpenProcess(
@@ -66,18 +59,12 @@ def _pid_alive(pid: Optional[int]) -> bool:
             return False
         ctypes.windll.kernel32.CloseHandle(handle)
         return True
-    # Reap the process when the caller is also its parent (notably tests and
-    # embedded launchers). A normal later CLI invocation is not the parent and
-    # receives ChildProcessError, then falls through to the portable probes.
     try:
         waited_pid, _ = os.waitpid(pid, os.WNOHANG)
         if waited_pid == pid:
             return False
     except ChildProcessError:
         pass
-    # kill(pid, 0) succeeds for a terminated child that is waiting to be
-    # reaped. Treat that zombie as stopped instead of reporting a phantom
-    # live server in status/restart and long-running test parents.
     try:
         with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as stat_file:
             fields = stat_file.read().split()
@@ -142,11 +129,7 @@ def clear_tunnel_pid() -> None:
 
 
 def is_running() -> bool:
-    """True when the server PID file points at a live process.
-
-    A stale PID file (process already dead) is cleaned up so status/start
-    never report a phantom running server.
-    """
+    """True when the server PID file points at a live process."""
     pid = read_pid()
     if not pid:
         return False
@@ -157,11 +140,7 @@ def is_running() -> bool:
 
 
 def tunnel_is_running() -> bool:
-    """True when the tunnel PID file points at a live process.
-
-    A stale tunnel.pid (process already dead) is cleaned up so status/stop
-    never report a phantom running tunnel.
-    """
+    """True when the tunnel PID file points at a live process."""
     pid = read_tunnel_pid()
     if not pid:
         return False
@@ -172,12 +151,7 @@ def tunnel_is_running() -> bool:
 
 
 def kill_pid(pid: Optional[int], timeout: float = 5.0) -> bool:
-    """Terminate a process by PID (SIGTERM, then force-kill).
-
-    On Windows, os.kill() can transiently fail with access-denied while the
-    target process is still initializing, so the SIGTERM is retried and a
-    `taskkill /F` fallback is used if the process survives.
-    """
+    """Terminate a process by PID (SIGTERM, then force-kill)."""
     if not pid or not _pid_alive(pid):
         return False
     deadline = time.time() + timeout
@@ -191,8 +165,6 @@ def kill_pid(pid: Optional[int], timeout: float = 5.0) -> bool:
         if not _pid_alive(pid):
             return True
         time.sleep(0.2)
-    # Force kill. SIGKILL is POSIX-only; on Windows use taskkill /F, which
-    # is more reliable than os.kill for processes stuck in early startup.
     if os.name == "nt":
         try:
             subprocess.run(
@@ -211,10 +183,7 @@ def kill_pid(pid: Optional[int], timeout: float = 5.0) -> bool:
 
 
 def start_server(env: Optional[dict] = None) -> int:
-    """Start the termux-mcp server as a detached child process.
-
-    Returns the child PID. Raises RuntimeError if already running.
-    """
+    """Start the termux-mcp server as a detached child process."""
     if is_running():
         raise RuntimeError(
             f"termux-mcp is already running (pid {read_pid()}). "
@@ -244,8 +213,6 @@ def stop_server(timeout: float = 10.0) -> bool:
         return False
     stopped = kill_pid(pid, timeout)
     if not stopped:
-        # Grace period: a process in the final termination window can still
-        # report alive for a moment after being killed.
         deadline = time.time() + 2.0
         while time.time() < deadline:
             if not _pid_alive(pid):
@@ -268,11 +235,48 @@ def port_open(port: int, host: str = "127.0.0.1", timeout: float = 1.0) -> bool:
 
 
 def wait_http(port: int, timeout: float = 15.0) -> bool:
-    """Wait until the port accepts connections (server warm-up)."""
+    """Wait until a TCP listener is available (REST warm-up helper)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if port_open(port):
             return True
+        time.sleep(0.3)
+    return False
+
+
+async def _mcp_probe(url: str, token: str) -> bool:
+    """Perform a real MCP initialize + tools/list round trip."""
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    async with streamablehttp_client(
+        url, headers={"Authorization": f"Bearer {token}"}
+    ) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            return bool(tools.tools)
+
+
+def mcp_healthy(port: int, token: str, timeout: float = 4.0) -> bool:
+    """Return True only when the MCP protocol handshake actually succeeds."""
+    if not token:
+        return False
+    url = f"http://127.0.0.1:{port}/mcp"
+    try:
+        return bool(asyncio.run(asyncio.wait_for(_mcp_probe(url, token), timeout=timeout)))
+    except Exception:
+        return False
+
+
+def wait_mcp(port: int, token: str, timeout: float = 15.0) -> bool:
+    """Wait for a usable MCP endpoint, not merely an open TCP port."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if port_open(port, timeout=0.5):
+            remaining = max(0.5, min(4.0, deadline - time.time()))
+            if mcp_healthy(port, token, timeout=remaining):
+                return True
         time.sleep(0.3)
     return False
 
