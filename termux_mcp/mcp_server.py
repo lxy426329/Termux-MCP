@@ -12,8 +12,6 @@ from . import operations
 from . import permissions
 from . import step_runner
 from . import task_log
-from . import walnut_board
-from . import walnut_inbox
 from .auth import get_auth_provider
 from .config import MCP_HOST, MCP_PORT, WORKSPACE_ROOT
 
@@ -145,58 +143,30 @@ def tool_get_battery() -> dict:
     return operations.get_battery()
 
 
-def tool_send_notification(title: str = "TermuxGPT", content: str = "", priority: str = "default") -> dict:
+def tool_send_notification(
+    title: str = "TermuxGPT", content: str = "", priority: str = "default"
+) -> dict:
     if not permissions.allows("device.write"):
         return permissions.denied("device.write")
     return operations.send_notification(title, content, priority)
-
-
-def tool_inbox_list(status: str = "pending", limit: int = 20, source: str = "") -> dict:
-    return walnut_inbox.list_events(status=status, limit=limit, source=source or None)
-
-
-def tool_inbox_get(event_id: str) -> dict:
-    return walnut_inbox.get_event(event_id)
-
-
-def tool_inbox_ack(event_id: str, note: str = "") -> dict:
-    return walnut_inbox.ack_event(event_id, note)
-
-
-def tool_inbox_status() -> dict:
-    return walnut_inbox.status()
-
-
-def tool_board_add(title: str, description: str = "", category: str = "general", priority: str = "normal", status: str = "idea", owner: str = "qian", effort: str = "normal", next_step: str = "", notes: str = "") -> dict:
-    return walnut_board.add_task(title, description, category, priority, status, owner, effort, next_step, notes)
-
-
-def tool_board_list(status: str = "open", owner: str = "all", limit: int = 50, effort: str = "all") -> dict:
-    return walnut_board.list_tasks(status=status, owner=owner, limit=limit, effort=effort)
-
-
-def tool_board_get(task_id: str) -> dict:
-    return walnut_board.get_task(task_id)
-
-
-def tool_board_update(task_id: str, status: str = "", priority: str = "", effort: str = "", next_step: str = "", notes: str = "", touch: bool = True) -> dict:
-    return walnut_board.update_task(task_id, status, priority, effort, next_step, notes, touch)
-
-
-def tool_board_status() -> dict:
-    return walnut_board.status()
 
 
 def tool_permissions_status() -> dict:
     return permissions.status()
 
 
-def tool_mcp_install(source: str, name: str = "", command: str = "", authorization: str = "") -> dict:
+def tool_mcp_install(
+    source: str, name: str = "", command: str = "", authorization: str = ""
+) -> dict:
     if not permissions.allows("managed.install"):
         return permissions.denied("managed.install")
     try:
         entry = managed_mcp.install(source, name, command, authorization)
-        return {"installed": True, "server": entry, "next": f"Call mcp_inspect with name={entry['name']!r}"}
+        return {
+            "installed": True,
+            "server": entry,
+            "next": f"Call mcp_inspect with name={entry['name']!r}",
+        }
     except managed_mcp.ManagedMCPError as exc:
         return {"installed": False, "error": str(exc)}
 
@@ -270,15 +240,6 @@ _STEP_TOOLS = {
     "get_battery": tool_get_battery,
     "send_notification": tool_send_notification,
     "permissions_status": tool_permissions_status,
-    "inbox_list": tool_inbox_list,
-    "inbox_get": tool_inbox_get,
-    "inbox_ack": tool_inbox_ack,
-    "inbox_status": tool_inbox_status,
-    "board_add": tool_board_add,
-    "board_list": tool_board_list,
-    "board_get": tool_board_get,
-    "board_update": tool_board_update,
-    "board_status": tool_board_status,
     "mcp_list": tool_mcp_list,
     "mcp_search": tool_mcp_search,
     "mcp_inspect": tool_mcp_inspect,
@@ -338,10 +299,13 @@ def _build_mcp_app():
         allowed_hosts=list(_LOCALHOST_HOSTS),
         allowed_origins=list(_LOCALHOST_ORIGINS),
     )
-    mcp = FastMCP("termux-mcp", json_response=True, transport_security=_transport_security)
+    mcp = FastMCP(
+        "termux-mcp", json_response=True, transport_security=_transport_security
+    )
     _transport_security = mcp.settings.transport_security
     _apply_public_url(_transport_security, config.get_public_url())
 
+    # Core Android/Termux execution surface.
     mcp.tool(name="run_command")(tool_run_command)
     mcp.tool(name="read_file")(tool_read_file)
     mcp.tool(name="write_file")(tool_write_file)
@@ -351,15 +315,9 @@ def _build_mcp_app():
     mcp.tool(name="get_battery")(tool_get_battery)
     mcp.tool(name="send_notification")(tool_send_notification)
     mcp.tool(name="permissions_status")(tool_permissions_status)
-    mcp.tool(name="inbox_list")(tool_inbox_list)
-    mcp.tool(name="inbox_get")(tool_inbox_get)
-    mcp.tool(name="inbox_ack")(tool_inbox_ack)
-    mcp.tool(name="inbox_status")(tool_inbox_status)
-    mcp.tool(name="board_add")(tool_board_add)
-    mcp.tool(name="board_list")(tool_board_list)
-    mcp.tool(name="board_get")(tool_board_get)
-    mcp.tool(name="board_update")(tool_board_update)
-    mcp.tool(name="board_status")(tool_board_status)
+
+    # Advanced/experimental managed-MCP surface. Mutating/calling operations
+    # are gated by the owner-selected permission policy (full mode only).
     mcp.tool(name="mcp_install")(tool_mcp_install)
     mcp.tool(name="mcp_list")(tool_mcp_list)
     mcp.tool(name="mcp_search")(tool_mcp_search)
@@ -367,6 +325,8 @@ def _build_mcp_app():
     mcp.tool(name="mcp_health")(tool_mcp_health)
     mcp.tool(name="mcp_call")(tool_mcp_call)
     mcp.tool(name="mcp_remove")(tool_mcp_remove)
+
+    # Bounded explicit multi-step execution; deliberately not a planner.
     mcp.tool(name="run_steps")(tool_run_steps)
     mcp.tool(name="task_list")(tool_task_list)
     mcp.tool(name="task_get")(tool_task_get)
@@ -387,8 +347,11 @@ def _build_mcp_app():
                 result = await auth.authenticate_async(dict(request.headers))
                 if result.authorized:
                     return await call_next(request)
-                return JSONResponse({"error": "Unauthorized"}, status_code=401,
-                                    headers=auth.challenge_headers())
+                return JSONResponse(
+                    {"error": "Unauthorized"},
+                    status_code=401,
+                    headers=auth.challenge_headers(),
+                )
         app.add_middleware(_AuthMiddleware)
     return app
 
@@ -405,9 +368,15 @@ def start_mcp_server():
         logger.warning("Failed to build MCP app: %s", exc)
         return None
     _start_transport_security_watcher()
-    uvicorn_config = uvicorn.Config(app, host=MCP_HOST, port=MCP_PORT, log_level="warning")
+    uvicorn_config = uvicorn.Config(
+        app, host=MCP_HOST, port=MCP_PORT, log_level="warning"
+    )
     server = uvicorn.Server(uvicorn_config)
-    thread = threading.Thread(target=server.run, daemon=True, name="mcp-uvicorn")
+    thread = threading.Thread(
+        target=server.run, daemon=True, name="mcp-uvicorn"
+    )
     thread.start()
-    logger.info("MCP Streamable HTTP endpoint on http://%s:%d/mcp", MCP_HOST, MCP_PORT)
+    logger.info(
+        "MCP Streamable HTTP endpoint on http://%s:%d/mcp", MCP_HOST, MCP_PORT
+    )
     return server
