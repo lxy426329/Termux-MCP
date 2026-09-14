@@ -15,6 +15,15 @@ def test_standard_keeps_command_risk_gate(monkeypatch):
     assert result["blocked"] is True
 
 
+def test_standard_blocks_managed_mcp_execution(monkeypatch):
+    monkeypatch.setattr(config, "PERMISSION_MODE", "standard")
+    assert permissions.allows("managed.install") is False
+    assert permissions.allows("managed.call") is False
+    assert permissions.allows("managed.remove") is False
+    assert mcp_server.tool_mcp_install("https://example.com/mcp")["error"] == "permission_denied"
+    assert mcp_server.tool_mcp_remove("missing")["error"] == "permission_denied"
+
+
 def test_full_mode_skips_command_gate_but_keeps_execution_layer(monkeypatch):
     monkeypatch.setattr(config, "PERMISSION_MODE", "full")
     monkeypatch.setattr(
@@ -33,4 +42,5 @@ def test_permission_status_is_owner_actionable(monkeypatch):
     result = permissions.status()
     assert result["mode"] == "full"
     assert result["full_control"] is True
+    assert result["managed_execution"] is True
     assert "termux-mcp permissions set" in result["change_command"]
