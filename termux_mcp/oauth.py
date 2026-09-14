@@ -1,27 +1,16 @@
 """OAuth 2.0 authorization-server + protected-resource support.
 
-Architecture (clean separation):
-  A. MCP Resource Server — validates Bearer tokens on /mcp (the static
-     token and/or OAuth access tokens) and serves RFC 9728 protected
-     resource metadata.
-  B. Authorization Server — self-hosted, standards-compliant
-     authorization-code + PKCE (RFC 6749 + RFC 7636) flow built on the
-     official `mcp` SDK abstractions (OAuthAuthorizationServerProvider,
-     AuthorizationHandler, TokenHandler, RegistrationHandler). PKCE S256
-     verification, one-time authorization codes, exact redirect_uri
-     matching, and refresh-token rotation are all handled by the SDK.
+OAuth is optional and disabled unless TERMUX_MCP_OAUTH_ISSUER is configured.
+The self-hosted authorization server implements authorization-code + PKCE via
+the official MCP SDK abstractions. Because this lightweight server currently
+has no interactive owner-consent UI, issuing authorization codes is denied by
+default. Owners who intentionally accept automatic approval must explicitly set
+TERMUX_MCP_OAUTH_AUTO_APPROVE=1.
 
-OAuth mode is enabled by setting TERMUX_MCP_OAUTH_ISSUER. The issuer may
-be a concrete URL or the special value "auto", which resolves to the
-current public URL (runtime tunnel URL > TERMUX_MCP_PUBLIC_URL) so the
-metadata stays correct even though tunnel URLs change on restart.
-
-All metadata handlers resolve the public URL / issuer at request time and
-never trust Host / X-Forwarded-* headers. No tokens or client secrets are
-ever logged. Registered clients and refresh/access tokens are persisted to
-~/.config/termux-mcp/oauth_state.json (chmod 0600) so a server restart does
-not invalidate an established OAuth session; authorization codes are never
-persisted.
+Registered clients and refresh/access tokens are persisted under the profile
+config directory with mode 0600. Authorization codes are never persisted.
+Metadata is derived from configured/runtime public URLs and never trusts Host or
+X-Forwarded-* headers.
 """
 
 import json
@@ -34,18 +23,11 @@ from urllib.parse import urlparse
 
 from . import config
 
-# OAuth discovery / authorization-server endpoints that must be reachable
-# without a Bearer token so MCP clients can complete the OAuth flow.
 _PUBLIC_PATHS = {"/authorize", "/token", "/register", "/revoke"}
-
-# Persistent OAuth state (registered clients + refresh/access tokens) so a
-# server restart does not force clients to re-authorize. Authorization codes
-# are NEVER persisted. The file is chmod 0600 and written atomically.
 _OAUTH_STATE_FILE: str = os.path.join(config.CONFIG_DIR, "oauth_state.json")
 
 
 def oauth_enabled() -> bool:
-    """True when OAuth mode is configured (TERMUX_MCP_OAUTH_ISSUER set)."""
     issuer = config.OAUTH_ISSUER.strip()
     if not issuer:
         return False
@@ -54,24 +36,21 @@ def oauth_enabled() -> bool:
     return _valid_http_url(issuer)
 
 
+def auto_approve_enabled() -> bool:
+    """Whether the owner explicitly opted into non-interactive OAuth approval."""
+    return bool(config.OAUTH_AUTO_APPROVE)
+
+
 def get_scopes() -> List[str]:
-    """Configured OAuth scopes (space-separated TERMUX_MCP_OAUTH_SCOPES)."""
     return [s for s in config.OAUTH_SCOPES.split() if s]
 
 
 def get_public_url() -> Optional[str]:
-    """Externally reachable MCP base URL (runtime > config), or None."""
     url = config.get_public_url().strip().rstrip("/")
     return url or None
 
 
 def get_issuer() -> Optional[str]:
-    """Resolved OAuth authorization-server issuer, or None.
-
-    A concrete TERMUX_MCP_OAUTH_ISSUER is used as-is; "auto" resolves to
-    the current public URL. None means the issuer cannot be determined yet
-    (e.g. "auto" with no public URL known).
-    """
     if not oauth_enabled():
         return None
     issuer = config.OAUTH_ISSUER.strip()
@@ -82,7 +61,6 @@ def get_issuer() -> Optional[str]:
 
 
 def get_resource_url() -> Optional[str]:
-    """Externally visible MCP resource URL (https://host/mcp), or None."""
     pub = get_public_url()
     if pub:
         return pub + "/mcp"
@@ -93,7 +71,6 @@ def get_resource_url() -> Optional[str]:
 
 
 def get_metadata_url() -> Optional[str]:
-    """RFC 9728 protected-resource metadata URL for this MCP resource."""
     resource = get_resource_url()
     if not resource:
         return None
@@ -105,11 +82,6 @@ def get_metadata_url() -> Optional[str]:
 
 
 def is_public_path(path: str) -> bool:
-    """True for OAuth discovery / AS endpoints that must not require a token.
-
-    Only meaningful when OAuth is enabled — when it is disabled there are
-    no discovery routes, so every path stays protected by the middleware.
-    """
     if not oauth_enabled():
         return False
     return path in _PUBLIC_PATHS or path.startswith("/.well-known/")
@@ -123,17 +95,8 @@ def _valid_http_url(url: str) -> bool:
         return False
 
 
-# ── Authorization Server provider ────────────────────────────────────────────
-
 class InMemoryAuthProvider:
-    """OAuth Authorization Server (RFC 6749 + RFC 7636) with disk persistence.
-
-    Implements the `mcp` SDK's OAuthAuthorizationServerProvider protocol.
-    Registered clients and refresh/access tokens are persisted to a chmod-0600
-    JSON file so a server restart does not invalidate an established OAuth
-    session (the client can keep refreshing without re-authorizing).
-    Authorization codes are short-lived, one-time, and NEVER persisted.
-    """
+    """OAuth AS provider with disk persistence for established sessions."""
 
     def __init__(
         self,
@@ -155,14 +118,7 @@ class InMemoryAuthProvider:
         self._lock = threading.Lock()
         self._load_state()
 
-    # ── persistence ──────────────────────────────────────────────────────────
-
     def _load_state(self) -> None:
-        """Restore clients + refresh/access tokens from disk (expired dropped).
-
-        Authorization codes are never stored, so an in-flight flow is not
-        resumable across a restart — only established sessions survive.
-        """
         if not self._state_file:
             return
         try:
@@ -197,7 +153,6 @@ class InMemoryAuthProvider:
             self._access_tokens[tok] = at
 
     def _save_state(self) -> None:
-        """Persist clients + refresh/access tokens (never authorization codes)."""
         if not self._state_file:
             return
         data = {
@@ -221,8 +176,6 @@ class InMemoryAuthProvider:
             pass
         os.replace(tmp, self._state_file)
 
-    # ── SDK provider protocol ────────────────────────────────────────────────
-
     async def get_client(self, client_id: str):
         return self._clients.get(client_id)
 
@@ -232,7 +185,19 @@ class InMemoryAuthProvider:
             self._save_state()
 
     async def authorize(self, client, params) -> str:
-        """Generate a short-lived, one-time authorization code and redirect."""
+        """Issue a short-lived code only after explicit owner opt-in.
+
+        This project does not yet ship a local interactive consent UI. Denying
+        by default prevents a public /register + /authorize pair from silently
+        becoming an automatic token minting endpoint.
+        """
+        if not auto_approve_enabled():
+            raise PermissionError(
+                "OAuth authorization requires device-owner approval. "
+                "Interactive consent is not implemented yet; explicitly set "
+                "TERMUX_MCP_OAUTH_AUTO_APPROVE=1 only if you accept automatic "
+                "approval for registered clients."
+            )
         from mcp.server.auth.provider import AuthorizationCode, construct_redirect_uri
 
         code = secrets.token_urlsafe(32)
@@ -247,7 +212,9 @@ class InMemoryAuthProvider:
             resource=params.resource,
             subject=None,
         )
-        return construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
+        return construct_redirect_uri(
+            str(params.redirect_uri), code=code, state=params.state
+        )
 
     async def load_authorization_code(self, client, authorization_code: str):
         code = self._codes.get(authorization_code)
@@ -259,7 +226,6 @@ class InMemoryAuthProvider:
         return code
 
     async def exchange_authorization_code(self, client, authorization_code):
-        # One-time use: the code is consumed by this exchange.
         with self._lock:
             self._codes.pop(authorization_code.code, None)
             token = self._issue_tokens(
@@ -280,7 +246,6 @@ class InMemoryAuthProvider:
             return token
 
     async def exchange_refresh_token(self, client, refresh_token, scopes):
-        # Rotation: the presented refresh token is revoked and replaced.
         with self._lock:
             self._refresh_tokens.pop(refresh_token.token, None)
             token = self._issue_tokens(client, scopes, subject=refresh_token.subject)
@@ -342,7 +307,6 @@ _auth_server_provider: Optional[InMemoryAuthProvider] = None
 
 
 def get_auth_server_provider() -> InMemoryAuthProvider:
-    """Process-wide Authorization Server provider (lazily created)."""
     global _auth_server_provider
     if _auth_server_provider is None:
         _auth_server_provider = InMemoryAuthProvider(get_scopes())
@@ -350,27 +314,20 @@ def get_auth_server_provider() -> InMemoryAuthProvider:
 
 
 def reset_auth_server_provider() -> None:
-    """Drop the cached AS provider (used by tests)."""
     global _auth_server_provider
     _auth_server_provider = None
 
 
 def get_token_verifier():
-    """SDK TokenVerifier that validates access tokens issued by our AS."""
     from mcp.server.auth.provider import ProviderTokenVerifier
 
     return ProviderTokenVerifier(get_auth_server_provider())
 
 
-# ── Dynamic metadata handlers ────────────────────────────────────────────────
-
 class _DynamicAuthServerMetadataHandler:
-    """Serves RFC 8414 AS metadata resolved from the current public URL."""
-
     async def handle(self, request):
         from pydantic import AnyHttpUrl
         from starlette.responses import JSONResponse
-
         from mcp.server.auth.json_response import PydanticJSONResponse
         from mcp.shared.auth import OAuthMetadata
 
@@ -386,7 +343,10 @@ class _DynamicAuthServerMetadataHandler:
             scopes_supported=get_scopes(),
             response_types_supported=["code"],
             grant_types_supported=["authorization_code", "refresh_token"],
-            token_endpoint_auth_methods_supported=["client_secret_post", "client_secret_basic"],
+            token_endpoint_auth_methods_supported=[
+                "client_secret_post",
+                "client_secret_basic",
+            ],
             code_challenge_methods_supported=["S256"],
         )
         return PydanticJSONResponse(
@@ -396,12 +356,9 @@ class _DynamicAuthServerMetadataHandler:
 
 
 class _DynamicProtectedResourceHandler:
-    """Serves RFC 9728 protected-resource metadata (dynamic resource URL)."""
-
     async def handle(self, request):
         from pydantic import AnyHttpUrl
         from starlette.responses import JSONResponse
-
         from mcp.server.auth.json_response import PydanticJSONResponse
         from mcp.shared.auth import ProtectedResourceMetadata
 
@@ -421,85 +378,51 @@ class _DynamicProtectedResourceHandler:
         )
 
 
-# ── Route builders ───────────────────────────────────────────────────────────
-
-def build_auth_routes() -> list:
-    """Authorization Server routes (RFC 8414 metadata + RFC 6749 endpoints).
-
-    Built on the official SDK handlers so PKCE S256 verification, one-time
-    authorization codes, exact redirect_uri matching, and refresh-token
-    rotation are handled by the SDK's TokenHandler.
-    """
+def build_auth_routes():
+    """Build OAuth authorization-server + metadata routes from SDK handlers."""
     from mcp.server.auth.handlers.authorize import AuthorizationHandler
     from mcp.server.auth.handlers.register import RegistrationHandler
     from mcp.server.auth.handlers.revoke import RevocationHandler
     from mcp.server.auth.handlers.token import TokenHandler
-    from mcp.server.auth.middleware.client_auth import ClientAuthenticator
-    from mcp.server.auth.routes import cors_middleware
-    from mcp.server.auth.settings import ClientRegistrationOptions
     from starlette.routing import Route
 
     provider = get_auth_server_provider()
-    client_authenticator = ClientAuthenticator(provider)
-    registration_options = ClientRegistrationOptions(
-        enabled=True,
-        valid_scopes=get_scopes(),
-        default_scopes=get_scopes(),
-    )
+    authorize_handler = AuthorizationHandler(provider)
+    token_handler = TokenHandler(provider)
+    register_handler = RegistrationHandler(provider)
+    revoke_handler = RevocationHandler(provider)
+    metadata_handler = _DynamicAuthServerMetadataHandler()
+
+    async def guarded_authorize(request):
+        if not auto_approve_enabled():
+            from starlette.responses import JSONResponse
+            return JSONResponse(
+                {
+                    "error": "access_denied",
+                    "error_description": (
+                        "OAuth automatic approval is disabled. "
+                        "Set TERMUX_MCP_OAUTH_AUTO_APPROVE=1 locally only if "
+                        "you intentionally accept non-interactive approval."
+                    ),
+                },
+                status_code=403,
+            )
+        return await authorize_handler.handle(request)
+
     return [
-        Route(
-            "/.well-known/oauth-authorization-server",
-            endpoint=cors_middleware(
-                _DynamicAuthServerMetadataHandler().handle, ["GET", "OPTIONS"]
-            ),
-            methods=["GET", "OPTIONS"],
-        ),
-        Route(
-            "/authorize",
-            endpoint=AuthorizationHandler(provider).handle,
-            methods=["GET", "POST"],
-        ),
-        Route(
-            "/token",
-            endpoint=cors_middleware(
-                TokenHandler(provider, client_authenticator).handle, ["POST", "OPTIONS"]
-            ),
-            methods=["POST", "OPTIONS"],
-        ),
-        Route(
-            "/register",
-            endpoint=cors_middleware(
-                RegistrationHandler(provider, registration_options).handle,
-                ["POST", "OPTIONS"],
-            ),
-            methods=["POST", "OPTIONS"],
-        ),
-        Route(
-            "/revoke",
-            endpoint=cors_middleware(
-                RevocationHandler(provider, client_authenticator).handle,
-                ["POST", "OPTIONS"],
-            ),
-            methods=["POST", "OPTIONS"],
-        ),
+        Route("/.well-known/oauth-authorization-server", metadata_handler.handle, methods=["GET"]),
+        Route("/authorize", guarded_authorize, methods=["GET", "POST"]),
+        Route("/token", token_handler.handle, methods=["POST"]),
+        Route("/register", register_handler.handle, methods=["POST"]),
+        Route("/revoke", revoke_handler.handle, methods=["POST"]),
     ]
 
 
-def build_protected_resource_routes() -> list:
-    """RFC 9728 protected-resource metadata routes (host-form + path-form)."""
-    from mcp.server.auth.routes import cors_middleware
+def build_protected_resource_routes():
     from starlette.routing import Route
 
     handler = _DynamicProtectedResourceHandler()
     return [
-        Route(
-            "/.well-known/oauth-protected-resource",
-            endpoint=cors_middleware(handler.handle, ["GET", "OPTIONS"]),
-            methods=["GET", "OPTIONS"],
-        ),
-        Route(
-            "/.well-known/oauth-protected-resource/mcp",
-            endpoint=cors_middleware(handler.handle, ["GET", "OPTIONS"]),
-            methods=["GET", "OPTIONS"],
-        ),
+        Route("/.well-known/oauth-protected-resource", handler.handle, methods=["GET"]),
+        Route("/.well-known/oauth-protected-resource/mcp", handler.handle, methods=["GET"]),
     ]
