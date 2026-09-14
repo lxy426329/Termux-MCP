@@ -1,16 +1,9 @@
-"""OAuth 2.0 authorization-server + protected-resource support.
+"""Optional OAuth 2.0 authorization-server and auth-discovery support.
 
-OAuth is optional and disabled unless TERMUX_MCP_OAUTH_ISSUER is configured.
-The self-hosted authorization server implements authorization-code + PKCE via
-the official MCP SDK abstractions. Because this lightweight server currently
-has no interactive owner-consent UI, the public /authorize route is denied by
-default. Owners who intentionally accept automatic approval must explicitly set
-TERMUX_MCP_OAUTH_AUTO_APPROVE=1.
-
-Registered clients and refresh/access tokens are persisted under the profile
-config directory with mode 0600. Authorization codes are never persisted.
-Metadata is derived from configured/runtime public URLs and never trusts Host or
-X-Forwarded-* headers.
+OAuth is disabled unless TERMUX_MCP_OAUTH_ISSUER is configured. The public
+/authorize route is denied by default because this lightweight server does not
+yet provide an interactive device-owner consent UI. Non-interactive approval
+requires the explicit local TERMUX_MCP_OAUTH_AUTO_APPROVE=1 opt-in.
 """
 
 import json
@@ -24,16 +17,12 @@ from urllib.parse import urlparse
 from . import config
 
 _PUBLIC_PATHS = {"/authorize", "/token", "/register", "/revoke"}
-_OAUTH_STATE_FILE: str = os.path.join(config.CONFIG_DIR, "oauth_state.json")
+_OAUTH_STATE_FILE = os.path.join(config.CONFIG_DIR, "oauth_state.json")
 
 
 def oauth_enabled() -> bool:
     issuer = config.OAUTH_ISSUER.strip()
-    if not issuer:
-        return False
-    if issuer == "auto":
-        return True
-    return _valid_http_url(issuer)
+    return bool(issuer) and (issuer == "auto" or _valid_http_url(issuer))
 
 
 def auto_approve_enabled() -> bool:
@@ -41,32 +30,26 @@ def auto_approve_enabled() -> bool:
 
 
 def get_scopes() -> List[str]:
-    return [s for s in config.OAUTH_SCOPES.split() if s]
+    return [scope for scope in config.OAUTH_SCOPES.split() if scope]
 
 
 def get_public_url() -> Optional[str]:
-    url = config.get_public_url().strip().rstrip("/")
-    return url or None
+    value = config.get_public_url().strip().rstrip("/")
+    return value or None
 
 
 def get_issuer() -> Optional[str]:
     if not oauth_enabled():
         return None
     issuer = config.OAUTH_ISSUER.strip()
-    if issuer and issuer != "auto":
+    if issuer != "auto":
         return issuer.rstrip("/")
-    pub = get_public_url()
-    return pub.rstrip("/") if pub else None
+    return get_public_url()
 
 
 def get_resource_url() -> Optional[str]:
-    pub = get_public_url()
-    if pub:
-        return pub + "/mcp"
-    issuer = get_issuer()
-    if issuer:
-        return issuer + "/mcp"
-    return None
+    base = get_public_url() or get_issuer()
+    return base.rstrip("/") + "/mcp" if base else None
 
 
 def get_metadata_url() -> Optional[str]:
@@ -81,21 +64,21 @@ def get_metadata_url() -> Optional[str]:
 
 
 def is_public_path(path: str) -> bool:
-    if not oauth_enabled():
-        return False
-    return path in _PUBLIC_PATHS or path.startswith("/.well-known/")
+    return oauth_enabled() and (
+        path in _PUBLIC_PATHS or path.startswith("/.well-known/")
+    )
 
 
-def _valid_http_url(url: str) -> bool:
+def _valid_http_url(value: str) -> bool:
     try:
-        parsed = urlparse(url)
+        parsed = urlparse(value)
         return parsed.scheme in ("http", "https") and bool(parsed.netloc)
     except Exception:
         return False
 
 
 class InMemoryAuthProvider:
-    """OAuth AS provider with disk persistence for established sessions."""
+    """MCP SDK OAuth provider with persistent established-session state."""
 
     def __init__(
         self,
@@ -121,59 +104,61 @@ class InMemoryAuthProvider:
         if not self._state_file:
             return
         try:
-            with open(self._state_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            with open(self._state_file, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
         except (OSError, ValueError):
             return
+
         from mcp.server.auth.provider import AccessToken, RefreshToken
         from mcp.shared.auth import OAuthClientInformationFull
 
         now = time.time()
-        for cid, raw in (data.get("clients") or {}).items():
+        for client_id, raw in (data.get("clients") or {}).items():
             try:
-                self._clients[cid] = OAuthClientInformationFull.model_validate(raw)
+                self._clients[client_id] = OAuthClientInformationFull.model_validate(raw)
             except Exception:
                 continue
-        for tok, raw in (data.get("refresh_tokens") or {}).items():
+        for token, raw in (data.get("refresh_tokens") or {}).items():
             try:
-                rt = RefreshToken.model_validate(raw)
+                value = RefreshToken.model_validate(raw)
             except Exception:
                 continue
-            if rt.expires_at and rt.expires_at < now:
-                continue
-            self._refresh_tokens[tok] = rt
-        for tok, raw in (data.get("access_tokens") or {}).items():
+            if not value.expires_at or value.expires_at >= now:
+                self._refresh_tokens[token] = value
+        for token, raw in (data.get("access_tokens") or {}).items():
             try:
-                at = AccessToken.model_validate(raw)
+                value = AccessToken.model_validate(raw)
             except Exception:
                 continue
-            if at.expires_at and at.expires_at < now:
-                continue
-            self._access_tokens[tok] = at
+            if not value.expires_at or value.expires_at >= now:
+                self._access_tokens[token] = value
 
     def _save_state(self) -> None:
         if not self._state_file:
             return
         data = {
             "clients": {
-                cid: c.model_dump(mode="json") for cid, c in self._clients.items()
+                key: value.model_dump(mode="json")
+                for key, value in self._clients.items()
             },
             "refresh_tokens": {
-                t: rt.model_dump(mode="json") for t, rt in self._refresh_tokens.items()
+                key: value.model_dump(mode="json")
+                for key, value in self._refresh_tokens.items()
             },
             "access_tokens": {
-                t: at.model_dump(mode="json") for t, at in self._access_tokens.items()
+                key: value.model_dump(mode="json")
+                for key, value in self._access_tokens.items()
             },
         }
         os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
-        tmp = self._state_file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        temp = self._state_file + ".tmp"
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
         try:
-            os.chmod(tmp, 0o600)
+            os.chmod(temp, 0o600)
         except OSError:
             pass
-        os.replace(tmp, self._state_file)
+        os.replace(temp, self._state_file)
 
     async def get_client(self, client_id: str):
         return self._clients.get(client_id)
@@ -184,12 +169,6 @@ class InMemoryAuthProvider:
             self._save_state()
 
     async def authorize(self, client, params) -> str:
-        """Generate a short-lived, one-time authorization code.
-
-        Public access to this method is guarded by build_auth_routes(); keeping
-        the provider protocol itself side-effect compatible also makes it easy
-        to test token semantics independently of the HTTP consent boundary.
-        """
         from mcp.server.auth.provider import AuthorizationCode, construct_redirect_uri
 
         code = secrets.token_urlsafe(32)
@@ -220,11 +199,11 @@ class InMemoryAuthProvider:
     async def exchange_authorization_code(self, client, authorization_code):
         with self._lock:
             self._codes.pop(authorization_code.code, None)
-            token = self._issue_tokens(
-                client, authorization_code.scopes, subject=authorization_code.subject
+            result = self._issue_tokens(
+                client, authorization_code.scopes, authorization_code.subject
             )
             self._save_state()
-            return token
+            return result
 
     async def load_refresh_token(self, client, refresh_token: str):
         with self._lock:
@@ -240,9 +219,9 @@ class InMemoryAuthProvider:
     async def exchange_refresh_token(self, client, refresh_token, scopes):
         with self._lock:
             self._refresh_tokens.pop(refresh_token.token, None)
-            token = self._issue_tokens(client, scopes, subject=refresh_token.subject)
+            result = self._issue_tokens(client, scopes, refresh_token.subject)
             self._save_state()
-            return token
+            return result
 
     async def load_access_token(self, token: str):
         with self._lock:
@@ -269,29 +248,29 @@ class InMemoryAuthProvider:
         from mcp.server.auth.provider import AccessToken, RefreshToken
         from mcp.shared.auth import OAuthToken
 
-        access = secrets.token_urlsafe(32)
-        refresh = secrets.token_urlsafe(32)
+        access_value = secrets.token_urlsafe(32)
+        refresh_value = secrets.token_urlsafe(32)
         now = int(time.time())
-        self._access_tokens[access] = AccessToken(
-            token=access,
+        self._access_tokens[access_value] = AccessToken(
+            token=access_value,
             client_id=client.client_id,
             scopes=scopes,
             expires_at=now + self._access_ttl,
             subject=subject,
         )
-        self._refresh_tokens[refresh] = RefreshToken(
-            token=refresh,
+        self._refresh_tokens[refresh_value] = RefreshToken(
+            token=refresh_value,
             client_id=client.client_id,
             scopes=scopes,
             expires_at=now + self._refresh_ttl,
             subject=subject,
         )
         return OAuthToken(
-            access_token=access,
+            access_token=access_value,
             token_type="Bearer",
             expires_in=self._access_ttl,
             scope=" ".join(scopes),
-            refresh_token=refresh,
+            refresh_token=refresh_value,
         )
 
 
@@ -318,15 +297,15 @@ def get_token_verifier():
 
 class _DynamicAuthServerMetadataHandler:
     async def handle(self, request):
-        from pydantic import AnyHttpUrl
-        from starlette.responses import JSONResponse
         from mcp.server.auth.json_response import PydanticJSONResponse
         from mcp.shared.auth import OAuthMetadata
+        from pydantic import AnyHttpUrl
+        from starlette.responses import JSONResponse
 
         issuer = get_issuer()
         if not issuer:
             return JSONResponse({"error": "not_found"}, status_code=404)
-        metadata = OAuthMetadata(
+        value = OAuthMetadata(
             issuer=AnyHttpUrl(issuer),
             authorization_endpoint=AnyHttpUrl(issuer + "/authorize"),
             token_endpoint=AnyHttpUrl(issuer + "/token"),
@@ -336,64 +315,67 @@ class _DynamicAuthServerMetadataHandler:
             response_types_supported=["code"],
             grant_types_supported=["authorization_code", "refresh_token"],
             token_endpoint_auth_methods_supported=[
-                "client_secret_post",
-                "client_secret_basic",
+                "client_secret_post", "client_secret_basic"
             ],
             code_challenge_methods_supported=["S256"],
         )
         return PydanticJSONResponse(
-            content=metadata,
-            headers={"Cache-Control": "public, max-age=3600"},
+            content=value, headers={"Cache-Control": "public, max-age=3600"}
         )
 
 
 class _DynamicProtectedResourceHandler:
     async def handle(self, request):
-        from pydantic import AnyHttpUrl
-        from starlette.responses import JSONResponse
         from mcp.server.auth.json_response import PydanticJSONResponse
         from mcp.shared.auth import ProtectedResourceMetadata
+        from pydantic import AnyHttpUrl
+        from starlette.responses import JSONResponse
 
         resource = get_resource_url()
         issuer = get_issuer()
         if not resource or not issuer:
             return JSONResponse({"error": "not_found"}, status_code=404)
-        metadata = ProtectedResourceMetadata(
+        value = ProtectedResourceMetadata(
             resource=AnyHttpUrl(resource),
             authorization_servers=[AnyHttpUrl(issuer)],
             scopes_supported=get_scopes(),
             bearer_methods_supported=["header"],
         )
         return PydanticJSONResponse(
-            content=metadata,
-            headers={"Cache-Control": "public, max-age=3600"},
+            content=value, headers={"Cache-Control": "public, max-age=3600"}
         )
 
 
-def build_auth_routes():
+def build_auth_routes() -> list:
+    """Build OAuth routes with the SDK version's required authenticators."""
     from mcp.server.auth.handlers.authorize import AuthorizationHandler
     from mcp.server.auth.handlers.register import RegistrationHandler
     from mcp.server.auth.handlers.revoke import RevocationHandler
     from mcp.server.auth.handlers.token import TokenHandler
+    from mcp.server.auth.middleware.client_auth import ClientAuthenticator
+    from mcp.server.auth.routes import cors_middleware
+    from mcp.server.auth.settings import ClientRegistrationOptions
+    from starlette.responses import JSONResponse
     from starlette.routing import Route
 
     provider = get_auth_server_provider()
+    client_authenticator = ClientAuthenticator(provider)
+    registration_options = ClientRegistrationOptions(
+        enabled=True,
+        valid_scopes=get_scopes(),
+        default_scopes=get_scopes(),
+    )
     authorize_handler = AuthorizationHandler(provider)
-    token_handler = TokenHandler(provider)
-    register_handler = RegistrationHandler(provider)
-    revoke_handler = RevocationHandler(provider)
-    metadata_handler = _DynamicAuthServerMetadataHandler()
 
     async def guarded_authorize(request):
         if not auto_approve_enabled():
-            from starlette.responses import JSONResponse
             return JSONResponse(
                 {
                     "error": "access_denied",
                     "error_description": (
-                        "OAuth automatic approval is disabled. "
-                        "Set TERMUX_MCP_OAUTH_AUTO_APPROVE=1 locally only if "
-                        "you intentionally accept non-interactive approval."
+                        "OAuth automatic approval is disabled. Set "
+                        "TERMUX_MCP_OAUTH_AUTO_APPROVE=1 locally only if you "
+                        "intentionally accept non-interactive approval."
                     ),
                 },
                 status_code=403,
@@ -403,29 +385,53 @@ def build_auth_routes():
     return [
         Route(
             "/.well-known/oauth-authorization-server",
-            metadata_handler.handle,
-            methods=["GET"],
+            endpoint=cors_middleware(
+                _DynamicAuthServerMetadataHandler().handle, ["GET", "OPTIONS"]
+            ),
+            methods=["GET", "OPTIONS"],
         ),
-        Route("/authorize", guarded_authorize, methods=["GET", "POST"]),
-        Route("/token", token_handler.handle, methods=["POST"]),
-        Route("/register", register_handler.handle, methods=["POST"]),
-        Route("/revoke", revoke_handler.handle, methods=["POST"]),
+        Route("/authorize", endpoint=guarded_authorize, methods=["GET", "POST"]),
+        Route(
+            "/token",
+            endpoint=cors_middleware(
+                TokenHandler(provider, client_authenticator).handle,
+                ["POST", "OPTIONS"],
+            ),
+            methods=["POST", "OPTIONS"],
+        ),
+        Route(
+            "/register",
+            endpoint=cors_middleware(
+                RegistrationHandler(provider, registration_options).handle,
+                ["POST", "OPTIONS"],
+            ),
+            methods=["POST", "OPTIONS"],
+        ),
+        Route(
+            "/revoke",
+            endpoint=cors_middleware(
+                RevocationHandler(provider, client_authenticator).handle,
+                ["POST", "OPTIONS"],
+            ),
+            methods=["POST", "OPTIONS"],
+        ),
     ]
 
 
-def build_protected_resource_routes():
+def build_protected_resource_routes() -> list:
+    from mcp.server.auth.routes import cors_middleware
     from starlette.routing import Route
 
     handler = _DynamicProtectedResourceHandler()
     return [
         Route(
             "/.well-known/oauth-protected-resource",
-            handler.handle,
-            methods=["GET"],
+            endpoint=cors_middleware(handler.handle, ["GET", "OPTIONS"]),
+            methods=["GET", "OPTIONS"],
         ),
         Route(
             "/.well-known/oauth-protected-resource/mcp",
-            handler.handle,
-            methods=["GET"],
+            endpoint=cors_middleware(handler.handle, ["GET", "OPTIONS"]),
+            methods=["GET", "OPTIONS"],
         ),
     ]
