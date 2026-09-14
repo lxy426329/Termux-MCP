@@ -22,15 +22,6 @@ EXPECTED_TOOLS = [
     "get_battery",
     "send_notification",
     "permissions_status",
-    "inbox_list",
-    "inbox_get",
-    "inbox_ack",
-    "inbox_status",
-    "board_add",
-    "board_list",
-    "board_get",
-    "board_update",
-    "board_status",
     "mcp_install",
     "mcp_list",
     "mcp_search",
@@ -77,12 +68,18 @@ def test_mcp_requires_auth(mcp_server):
 
 
 def test_mcp_rejects_wrong_token(mcp_server):
-    r = httpx.post(mcp_server, json={}, headers={"Authorization": "Bearer wrong-token-0000000000000000"})
+    r = httpx.post(
+        mcp_server,
+        json={},
+        headers={"Authorization": "Bearer wrong-token-0000000000000000"},
+    )
     assert r.status_code == 401
 
 
 def test_mcp_accepts_valid_token(mcp_server):
-    r = httpx.post(mcp_server, json={}, headers={"Authorization": f"Bearer {AUTH_TOKEN}"})
+    r = httpx.post(
+        mcp_server, json={}, headers={"Authorization": f"Bearer {AUTH_TOKEN}"}
+    )
     assert r.status_code != 401
 
 
@@ -101,21 +98,29 @@ def test_tools_list_and_call_smoke(mcp_server):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = await session.list_tools()
-                assert [t.name for t in tools.tools] == EXPECTED_TOOLS
+                names = [t.name for t in tools.tools]
+                assert names == EXPECTED_TOOLS
+                assert not any(name.startswith(("inbox_", "board_")) for name in names)
 
                 res = await session.call_tool("run_command", {"cmd": "echo hello"})
                 assert res.isError is False
                 text = res.content[0].text
-                for key in ("stdout", "stderr", "exit_code", "truncated", "risk_level", "snapshots"):
+                for key in (
+                    "stdout", "stderr", "exit_code", "truncated",
+                    "risk_level", "snapshots",
+                ):
                     assert f'"{key}"' in text
                 assert "hello" in text
 
-                batch = await session.call_tool("run_steps", {
-                    "steps": [
-                        {"tool": "run_command", "arguments": {"cmd": "echo one"}},
-                        {"tool": "run_command", "arguments": {"cmd": "echo two"}},
-                    ]
-                })
+                batch = await session.call_tool(
+                    "run_steps",
+                    {
+                        "steps": [
+                            {"tool": "run_command", "arguments": {"cmd": "echo one"}},
+                            {"tool": "run_command", "arguments": {"cmd": "echo two"}},
+                        ]
+                    },
+                )
                 assert batch.isError is False
                 batch_text = batch.content[0].text
                 assert '"executed_steps": 2' in batch_text
@@ -153,7 +158,9 @@ def test_tools_call_warning_confirmation_required(mcp_server):
         ) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                res = await session.call_tool("run_command", {"cmd": "rm -rf somefile"})
+                res = await session.call_tool(
+                    "run_command", {"cmd": "rm -rf somefile"}
+                )
                 text = res.content[0].text
                 assert '"confirmation_required": true' in text
                 assert '"risk_level": "warning"' in text
