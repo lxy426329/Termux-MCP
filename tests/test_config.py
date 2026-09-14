@@ -82,6 +82,7 @@ def test_token_not_in_launcher_output(isolated_config, monkeypatch, capsys):
     monkeypatch.setattr(process, "is_running", lambda: False)
     monkeypatch.setattr(process, "start_server", lambda env=None: 12345)
     monkeypatch.setattr(process, "wait_http", lambda port, timeout=15: True)
+    monkeypatch.setattr(process, "wait_mcp", lambda port, token, timeout=15: True)
 
     cli.cmd_start(Args())
     out = capsys.readouterr().out
@@ -103,15 +104,15 @@ def test_token_command_hides_by_default(isolated_config, monkeypatch, capsys):
     assert "configured" in out
 
 
-def test_save_user_preferences_persists_onboarding(isolated_config):
+def test_save_user_preferences_persists_onboarding_without_enabling_oauth(isolated_config):
     config.save_user_preferences("claude", "full")
     assert config.CLIENT_TARGET == "claude"
     assert config.PERMISSION_MODE == "full"
     assert config.SETUP_COMPLETE is True
-    assert config.OAUTH_ISSUER == "auto"
+    assert config.OAUTH_ISSUER == ""
     with open(config.CONFIG_FILE, encoding="utf-8") as f:
         content = f.read()
     assert "TERMUX_MCP_CLIENT=claude" in content
     assert "TERMUX_MCP_PERMISSIONS=full" in content
     assert "TERMUX_MCP_SETUP_COMPLETE=1" in content
-    assert "TERMUX_MCP_OAUTH_ISSUER=auto" in content
+    assert "TERMUX_MCP_OAUTH_ISSUER=" not in content
