@@ -5,15 +5,14 @@ build-backend = "flit_core.buildapi"
 [project]
 name = "termux-mcp"
 version = "0.10.0"
-description = "Powerful MCP server for Termux — let AI agents run shell commands on your Android device in real time"
+description = "Android AI execution gateway — securely expose Termux shell, files, and device capabilities through standard MCP"
 readme = "README.md"
 license = {text = "AGPL-3.0"}
 classifiers = [
     "License :: OSI Approved :: GNU Affero General Public License v3",
 ]
 authors = [{name = "Parixit Sutariya"}]
-# The official MCP Python SDK requires Python >= 3.10 (was 3.8 before the
-# MCP layer was added).
+maintainers = [{name = "lxy426329"}]
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.28,<2",
